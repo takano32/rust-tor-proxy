@@ -1,0 +1,7 @@
+[package]
+name = "sorahost-tor-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "A small HTTP proxy that routes traffic through Tor SOCKS5"
+
+[dependencies]
