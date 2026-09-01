@@ -1,20 +1,14 @@
 # sorahost-tor-proxy
 
-Small HTTP/HTTPS forward proxy written in Rust. Outbound connections are made through a Tor SOCKS5 proxy, so DNS names are also sent to Tor for resolution.
+Small HTTP/HTTPS forward proxy written in Rust. It embeds the Arti Tor client and routes outbound connections through the Tor network; no separate `tor` daemon or SOCKS listener is required.
 
 ## Run
-
-Start Tor with a SOCKS listener (the usual default is `127.0.0.1:9050`), then:
 
 ```sh
 SERVER_PORT=8080 cargo run --release
 ```
 
-Set `TOR_SOCKS_ADDR` if Tor listens elsewhere:
-
-```sh
-SERVER_PORT=8080 TOR_SOCKS_ADDR=127.0.0.1:9150 cargo run --release
-```
+On first launch, Arti downloads Tor directory information and creates its persistent state automatically. Startup may therefore take a little longer.
 
 Use it with an HTTP proxy client, for example:
 

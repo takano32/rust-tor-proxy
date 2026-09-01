@@ -5,3 +5,7 @@ edition = "2021"
 description = "A small HTTP proxy that routes traffic through Tor SOCKS5"
 
 [dependencies]
+arti-client = { version = "0.45", default-features = false, features = ["async-std", "rustls", "compression"] }
+async-std = { version = "1", features = ["attributes"] }
+futures-util = "0.3"
+tor-rtcompat = { version = "0.45", default-features = false, features = ["async-std", "rustls"] }

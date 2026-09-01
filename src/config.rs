@@ -1,10 +1,7 @@
 use std::{env, io};
 
-pub const DEFAULT_TOR_SOCKS_ADDR: &str = "127.0.0.1:9050";
-
 pub struct Config {
     pub listen_port: u16,
-    pub tor_socks_addr: String,
 }
 
 impl Config {
@@ -24,10 +21,6 @@ impl Config {
                 "SERVER_PORT must be between 1 and 65535",
             ));
         }
-        Ok(Self {
-            listen_port,
-            tor_socks_addr: env::var("TOR_SOCKS_ADDR")
-                .unwrap_or_else(|_| DEFAULT_TOR_SOCKS_ADDR.into()),
-        })
+        Ok(Self { listen_port })
     }
 }
