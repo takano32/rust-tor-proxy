@@ -1,0 +1,5 @@
+# arti pulls in a large dependency graph; some crates (notably `syn`) need
+# close to a gigabyte each to compile. Build with a single rustc process
+# at a time so builds fit in memory-constrained containers.
+[build]
+jobs = 1
