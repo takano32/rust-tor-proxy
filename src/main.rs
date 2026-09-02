@@ -2,7 +2,9 @@
 mod log;
 
 mod config;
+mod ffi;
 mod relay;
+mod util;
 
 fn main() -> std::io::Result<()> {
     log::init();
