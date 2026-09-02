@@ -1,5 +1,4 @@
-# arti pulls in a large dependency graph; some crates (notably `syn`) need
-# close to a gigabyte each to compile. Build with a single rustc process
-# at a time so builds fit in memory-constrained containers.
+# Keep rustc's peak RSS low enough for 128-240MB build environments: one
+# codegen process at a time. See TASKS.md section 0.1 for the measurements.
 [build]
 jobs = 1

@@ -2,10 +2,16 @@
 name = "sorahost-tor-proxy"
 version = "0.1.0"
 edition = "2021"
-description = "A small HTTP proxy that routes traffic through Tor SOCKS5"
+description = "A dependency-free Tor client exposing a SOCKS5 listener"
 
+# No external crates on purpose: the whole point of this build is to fit a
+# `cargo build --release` into a ~200MB cgroup. Cryptography and TLS come from
+# the system OpenSSL 3 via hand-written FFI (see src/ffi/).
 [dependencies]
-arti-client = { version = "0.45", default-features = false, features = ["async-std", "rustls", "compression"] }
-async-std = { version = "1", features = ["attributes"] }
-futures-util = "0.3"
-tor-rtcompat = { version = "0.45", default-features = false, features = ["async-std", "rustls"] }
+
+# Debug info is the single biggest driver of rustc's peak RSS for this crate.
+[profile.release]
+debug = 0
+
+[profile.dev]
+debug = 0

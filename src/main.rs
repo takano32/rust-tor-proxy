@@ -1,9 +1,16 @@
-mod config;
-mod http;
-mod relay;
-mod server;
+#[macro_use]
+mod log;
 
-#[async_std::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    server::run(config::Config::from_env()?).await
+mod config;
+mod relay;
+
+fn main() -> std::io::Result<()> {
+    log::init();
+    let config = config::Config::from_env()?;
+    info!(
+        "starting: socks5 port {}, state dir {}",
+        config.listen_port,
+        config.state_dir.display()
+    );
+    Ok(())
 }
