@@ -28,7 +28,7 @@ const USABLE: u16 = FLAG_RUNNING | FLAG_VALID;
 pub const GUARD_FLAGS: u16 = USABLE | FLAG_GUARD | FLAG_STABLE | FLAG_FAST;
 
 /// Relays already committed to the path under construction.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PathConstraints {
     identities: Vec<[u8; 20]>,
     subnets: Vec<[u8; 2]>,
@@ -51,6 +51,20 @@ impl PathConstraints {
         self.identities.push(identity);
         self.subnets.push(subnet16);
         self.families.push(family);
+    }
+
+    /// True if a relay known only by identity, address and family may join --
+    /// the form a pre-built circuit's hops are remembered in.
+    pub fn accepts_relay(
+        &self,
+        identity: &[u8; 20],
+        subnet16: [u8; 2],
+        family: &[[u8; 20]],
+    ) -> bool {
+        !self.identities.contains(identity)
+            && !self.subnets.contains(&subnet16)
+            && !self.families.iter().any(|f| f.contains(identity))
+            && !family.iter().any(|id| self.identities.contains(id))
     }
 
     /// True if `router` may join the path.

@@ -56,6 +56,11 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         crate::debug!("{peer}: could not set a handshake timeout: {e}");
         return;
     }
+    // The tunnelled traffic is already carried in 498-byte relay cells, so
+    // there is nothing for Nagle to coalesce and only latency to add.
+    if let Err(e) = client.set_nodelay(true) {
+        crate::debug!("{peer}: could not disable Nagle: {e}");
+    }
     let request = match negotiate(&mut client) {
         Ok(request) => request,
         Err(e) => {
@@ -95,7 +100,14 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
 
     let reader = stream.try_clone();
     if let Err(e) = relay::bidirectional(client, reader, stream.try_clone()) {
-        crate::debug!("{peer}: relay ended: {e}");
+        // With optimistic data the SOCKS reply has already gone out by the
+        // time a refusal arrives, so the client sees a closed connection
+        // rather than a status code. Say why here, or the reason is lost.
+        if circuit::is_stream_end(&e) {
+            crate::info!("{peer}: the far end closed the stream: {e}");
+        } else {
+            crate::debug!("{peer}: relay ended: {e}");
+        }
     }
     stream.close();
 }

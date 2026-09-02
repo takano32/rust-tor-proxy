@@ -9,6 +9,7 @@ pub mod maintain;
 pub mod ntor;
 pub mod ntor_v3;
 pub mod path;
+pub mod pool;
 
 use std::net::SocketAddrV4;
 

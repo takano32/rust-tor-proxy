@@ -437,6 +437,14 @@ impl Circuit {
         self.inner.state.lock().unwrap().hops.len()
     }
 
+    /// How many streams are open on this circuit. The pool spreads new
+    /// streams across circuits by this figure: with window-based flow control
+    /// each circuit is capped at 1000 cells per round trip, so several
+    /// circuits carry more in total than one ever can.
+    pub fn open_streams(&self) -> usize {
+        self.inner.streams.lock().unwrap().len()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire) || self.inner.chan.is_closed()
     }
@@ -492,6 +500,8 @@ impl Circuit {
         self.open_stream(RELAY_BEGIN_DIR, &[])
     }
 
+    /// Send a BEGIN and hand back the stream at once, without waiting for the
+    /// far end to confirm it. See [`TorStream`] for why.
     fn open_stream(&self, relay_command: u8, payload: &[u8]) -> io::Result<TorStream> {
         let hop = self.last_hop()?;
         let stream_id = self.alloc_stream_id()?;
@@ -519,41 +529,7 @@ impl Circuit {
             self.inner.streams.lock().unwrap().remove(&stream_id);
             return Err(e);
         }
-
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        let mut buf = shared.buf.lock().unwrap();
-        loop {
-            if buf.connected {
-                break;
-            }
-            if let Some(reason) = buf.ended {
-                drop(buf);
-                self.inner.streams.lock().unwrap().remove(&stream_id);
-                return Err(StreamEnd(reason).into());
-            }
-            if let Some(err) = buf.error.clone() {
-                drop(buf);
-                self.inner.streams.lock().unwrap().remove(&stream_id);
-                return Err(io::Error::other(err));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                drop(buf);
-                self.inner.streams.lock().unwrap().remove(&stream_id);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for RELAY_CONNECTED",
-                ));
-            }
-            let (guard, _) = shared.cond.wait_timeout(buf, deadline - now).unwrap();
-            buf = guard;
-        }
-        drop(buf);
-
-        Ok(TorStream {
-            circuit: self.clone(),
-            shared,
-        })
+        Ok(TorStream::new(self.clone(), shared))
     }
 
     fn alloc_stream_id(&self) -> io::Result<u16> {
@@ -989,28 +965,178 @@ struct StreamBuf {
     unacked: i32,
 }
 
+/// How many bytes written before the far end confirms the stream are kept, in
+/// case the attempt has to be made again on another circuit. C Tor keeps a
+/// comparable amount for the same reason; past this the request is too big to
+/// be worth replaying and the connection simply fails.
+const MAX_REPLAY_BYTES: usize = 16 * 1024;
+
+/// How many times one connection may be started again elsewhere.
+const MAX_REATTACHES: usize = 2;
+
+/// How the client opens this connection again on a different circuit.
+/// Given the circuit that let the connection down, open it again elsewhere.
+pub type Reattach = Box<dyn Fn(&Circuit) -> io::Result<TorStream> + Send + Sync>;
+
 /// A TCP-like stream carried by a circuit.
+///
+/// The stream is *optimistic*: `begin_stream` returns as soon as the BEGIN has
+/// been sent, without waiting for the exit's CONNECTED. The consensus sets
+/// `UseOptimisticData=1` and tor-spec/opening-streams.md allows it, and it
+/// takes a whole round trip off every connection -- the client's first bytes
+/// (a TLS ClientHello, say) travel in the same direction as the BEGIN instead
+/// of after the reply to it.
+///
+/// The cost is that a refusal now arrives after the caller has been told the
+/// connection succeeded. For the one refusal that is about the exit rather
+/// than the destination -- EXITPOLICY -- and for a circuit that dies under
+/// the stream, the bytes written so far are replayed on a fresh circuit and
+/// the caller sees nothing. A refusal that is about the destination
+/// (CONNECTREFUSED, RESOLVEFAILED) would get the same answer anywhere, so it
+/// is passed straight through.
 pub struct TorStream {
+    inner: Arc<StreamState>,
+}
+
+struct StreamState {
+    /// The circuit and stream currently carrying this connection, replaced
+    /// wholesale by a reattach. Both halves of a `try_clone` share it, so a
+    /// reader and a writer move together.
+    live: Mutex<Live>,
+    replay: Mutex<Replay>,
+    /// Absent for streams that cannot be moved, such as a directory fetch.
+    reattach: std::sync::OnceLock<Reattach>,
+}
+
+#[derive(Clone)]
+struct Live {
     circuit: Circuit,
     shared: Arc<StreamShared>,
 }
 
+struct Replay {
+    buffered: Vec<u8>,
+    /// False once the far end has answered, once more has been written than
+    /// is worth keeping, or once the attempts are used up.
+    allowed: bool,
+    attempts: usize,
+}
+
 impl TorStream {
+    fn new(circuit: Circuit, shared: Arc<StreamShared>) -> Self {
+        Self {
+            inner: Arc::new(StreamState {
+                live: Mutex::new(Live { circuit, shared }),
+                replay: Mutex::new(Replay {
+                    buffered: Vec::new(),
+                    allowed: true,
+                    attempts: 0,
+                }),
+                reattach: std::sync::OnceLock::new(),
+            }),
+        }
+    }
+
     /// A second handle on the same stream, so the relay loop can read on one
     /// thread and write on another.
     pub fn try_clone(&self) -> Self {
         Self {
-            circuit: self.circuit.clone(),
-            shared: Arc::clone(&self.shared),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Say how to open this connection again elsewhere, which is what makes
+    /// an optimistic failure recoverable. Without it a failure is final.
+    pub fn set_reattach(&self, reattach: Reattach) {
+        let _ = self.inner.reattach.set(reattach);
+    }
+
+    fn live(&self) -> Live {
+        self.inner.live.lock().unwrap().clone()
+    }
+
+    /// Whether this failure is worth trying again on another circuit, and
+    /// whether we are still in a position to.
+    fn may_retry(&self, error: &io::Error) -> bool {
+        let worth_it = match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<StreamEnd>())
+        {
+            // The exit will not carry this destination. Another one may.
+            Some(end) => end.0 == END_REASON_EXITPOLICY,
+            // The circuit went away under us, which says nothing about the
+            // destination.
+            None => matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionAborted | io::ErrorKind::NotConnected
+            ),
+        };
+        if !worth_it || self.inner.reattach.get().is_none() {
+            return false;
+        }
+        let replay = self.inner.replay.lock().unwrap();
+        replay.allowed && replay.attempts < MAX_REATTACHES
+    }
+
+    /// Open the connection again on a fresh circuit and re-send whatever was
+    /// written before the first attempt failed.
+    fn reattach(&self) -> io::Result<()> {
+        let Some(open) = self.inner.reattach.get() else {
+            return Err(io::Error::other("this stream cannot be moved"));
+        };
+        let buffered = {
+            let mut replay = self.inner.replay.lock().unwrap();
+            replay.attempts += 1;
+            replay.buffered.clone()
+        };
+
+        let failed = self.live().circuit;
+        let fresh = open(&failed)?;
+        let live = fresh.live();
+        crate::debug!(
+            "connection moved to circuit {}, replaying {} buffered bytes",
+            live.circuit.circ_id(),
+            buffered.len()
+        );
+        *self.inner.live.lock().unwrap() = live.clone();
+
+        for chunk in buffered.chunks(RELAY_DATA_MAX) {
+            send_stream_data(&live, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Note what was sent, in case it has to be sent again.
+    fn record_written(&self, data: &[u8]) {
+        let mut replay = self.inner.replay.lock().unwrap();
+        if !replay.allowed {
+            return;
+        }
+        if replay.buffered.len() + data.len() > MAX_REPLAY_BYTES {
+            // Too much to be worth holding: from here the connection lives or
+            // dies on the circuit it is on.
+            replay.allowed = false;
+            replay.buffered = Vec::new();
+            return;
+        }
+        replay.buffered.extend_from_slice(data);
+    }
+
+    /// The far end has answered, so nothing needs replaying any more.
+    fn note_established(&self) {
+        let mut replay = self.inner.replay.lock().unwrap();
+        if replay.allowed {
+            replay.allowed = false;
+            replay.buffered = Vec::new();
         }
     }
 
     /// Ask the far end for another increment once the application has drained
     /// enough of the buffer; this is what stops a slow reader from being sent
     /// more than it can hold.
-    fn maybe_send_sendme(&self) -> io::Result<()> {
+    fn maybe_send_sendme(&self, live: &Live) -> io::Result<()> {
         loop {
-            let mut buf = self.shared.buf.lock().unwrap();
+            let mut buf = live.shared.buf.lock().unwrap();
             let backlog_low = buf.data.len() <= STREAM_WINDOW_INCREMENT as usize * RELAY_DATA_MAX;
             if buf.unacked < STREAM_WINDOW_INCREMENT || !backlog_low {
                 return Ok(());
@@ -1018,33 +1144,109 @@ impl TorStream {
             buf.unacked -= STREAM_WINDOW_INCREMENT;
             buf.deliver_window += STREAM_WINDOW_INCREMENT;
             drop(buf);
-            self.circuit
-                .send_relay(self.shared.hop, RELAY_SENDME, self.shared.id, &[], false)?;
+            live.circuit
+                .send_relay(live.shared.hop, RELAY_SENDME, live.shared.id, &[], false)?;
         }
     }
 
     /// Tell the exit we are done with this stream.
     pub fn close(&self) {
-        let _ = self.circuit.send_relay(
-            self.shared.hop,
+        let live = self.live();
+        let _ = live.circuit.send_relay(
+            live.shared.hop,
             RELAY_END,
-            self.shared.id,
+            live.shared.id,
             &[END_REASON_DONE],
             false,
         );
-        self.circuit
+        live.circuit
             .inner
             .streams
             .lock()
             .unwrap()
-            .remove(&self.shared.id);
-        let mut buf = self.shared.buf.lock().unwrap();
+            .remove(&live.shared.id);
+        let mut buf = live.shared.buf.lock().unwrap();
         if buf.ended.is_none() {
             buf.ended = Some(END_REASON_DONE);
         }
         drop(buf);
-        self.shared.cond.notify_all();
+        live.shared.cond.notify_all();
     }
+}
+
+/// Wait for the far end to say something on this stream: data, a refusal, or
+/// the circuit failing under it.
+fn read_stream(live: &Live, out: &mut [u8]) -> io::Result<usize> {
+    let mut buf = live.shared.buf.lock().unwrap();
+    loop {
+        if !buf.data.is_empty() {
+            let n = buf.data.len().min(out.len());
+            for (slot, byte) in out.iter_mut().zip(buf.data.drain(..n)) {
+                *slot = byte;
+            }
+            return Ok(n);
+        }
+        if let Some(err) = buf.error.clone() {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, err));
+        }
+        if let Some(reason) = buf.ended {
+            // A clean close reads as EOF; anything else is an error.
+            return match reason {
+                END_REASON_DONE | END_REASON_MISC => Ok(0),
+                other => Err(StreamEnd(other).into()),
+            };
+        }
+        let (guard, _) = live
+            .shared
+            .cond
+            .wait_timeout(buf, Duration::from_secs(1))
+            .unwrap();
+        buf = guard;
+        if live.circuit.is_closed() && buf.data.is_empty() {
+            return Err(circuit_closed());
+        }
+    }
+}
+
+/// Send one chunk on a stream, waiting for a SENDME if its window is spent.
+///
+/// The stream may not be connected yet; that is the point of optimistic data,
+/// and the exit queues what arrives before it has answered.
+fn send_stream_data(live: &Live, chunk: &[u8]) -> io::Result<()> {
+    let deadline = Instant::now() + SENDME_TIMEOUT;
+    let mut buf = live.shared.buf.lock().unwrap();
+    while buf.package_window <= 0 {
+        if let Some(reason) = buf.ended {
+            return Err(StreamEnd(reason).into());
+        }
+        if let Some(err) = buf.error.clone() {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, err));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stream send window stayed empty",
+            ));
+        }
+        let (guard, _) = live
+            .shared
+            .cond
+            .wait_timeout(buf, (deadline - now).min(Duration::from_secs(1)))
+            .unwrap();
+        buf = guard;
+        if live.circuit.is_closed() {
+            return Err(circuit_closed());
+        }
+    }
+    if let Some(reason) = buf.ended {
+        return Err(StreamEnd(reason).into());
+    }
+    buf.package_window -= 1;
+    drop(buf);
+
+    live.circuit
+        .send_data(live.shared.hop, live.shared.id, chunk)
 }
 
 impl io::Read for TorStream {
@@ -1052,39 +1254,23 @@ impl io::Read for TorStream {
         if out.is_empty() {
             return Ok(0);
         }
-        let n = {
-            let mut buf = self.shared.buf.lock().unwrap();
-            loop {
-                if !buf.data.is_empty() {
-                    let n = buf.data.len().min(out.len());
-                    for (slot, byte) in out.iter_mut().zip(buf.data.drain(..n)) {
-                        *slot = byte;
-                    }
-                    break n;
+        loop {
+            let live = self.live();
+            match read_stream(&live, out) {
+                Ok(n) => {
+                    // Anything at all coming back means the far end answered,
+                    // so there is no longer anything to replay.
+                    self.note_established();
+                    self.maybe_send_sendme(&live)?;
+                    return Ok(n);
                 }
-                if let Some(err) = buf.error.clone() {
-                    return Err(io::Error::other(err));
+                Err(e) if self.may_retry(&e) => {
+                    crate::info!("stream failed before it was established ({e}); trying again");
+                    self.reattach()?;
                 }
-                if let Some(reason) = buf.ended {
-                    // A clean close reads as EOF; anything else is an error.
-                    return match reason {
-                        END_REASON_DONE | END_REASON_MISC => Ok(0),
-                        other => Err(StreamEnd(other).into()),
-                    };
-                }
-                let (guard, _) = self
-                    .shared
-                    .cond
-                    .wait_timeout(buf, Duration::from_secs(1))
-                    .unwrap();
-                buf = guard;
-                if self.circuit.is_closed() && buf.data.is_empty() {
-                    return Err(circuit_closed());
-                }
+                Err(e) => return Err(e),
             }
-        };
-        self.maybe_send_sendme()?;
-        Ok(n)
+        }
     }
 }
 
@@ -1094,42 +1280,23 @@ impl io::Write for TorStream {
             return Ok(0);
         }
         let chunk = &data[..data.len().min(RELAY_DATA_MAX)];
-
-        let deadline = Instant::now() + SENDME_TIMEOUT;
-        let mut buf = self.shared.buf.lock().unwrap();
-        while buf.package_window <= 0 {
-            if let Some(reason) = buf.ended {
-                return Err(StreamEnd(reason).into());
+        loop {
+            let live = self.live();
+            if live.shared.buf.lock().unwrap().connected {
+                self.note_established();
             }
-            if let Some(err) = buf.error.clone() {
-                return Err(io::Error::other(err));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "stream send window stayed empty",
-                ));
-            }
-            let (guard, _) = self
-                .shared
-                .cond
-                .wait_timeout(buf, (deadline - now).min(Duration::from_secs(1)))
-                .unwrap();
-            buf = guard;
-            if self.circuit.is_closed() {
-                return Err(circuit_closed());
+            match send_stream_data(&live, chunk) {
+                Ok(()) => {
+                    self.record_written(chunk);
+                    return Ok(chunk.len());
+                }
+                Err(e) if self.may_retry(&e) => {
+                    crate::info!("stream failed before it was established ({e}); trying again");
+                    self.reattach()?;
+                }
+                Err(e) => return Err(e),
             }
         }
-        if let Some(reason) = buf.ended {
-            return Err(StreamEnd(reason).into());
-        }
-        buf.package_window -= 1;
-        drop(buf);
-
-        self.circuit
-            .send_data(self.shared.hop, self.shared.id, chunk)?;
-        Ok(chunk.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {

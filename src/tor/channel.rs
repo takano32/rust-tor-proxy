@@ -72,6 +72,12 @@ impl Channel {
         expected_ed_identity: Option<&[u8; 32]>,
     ) -> io::Result<Self> {
         let sock = TcpStream::connect_timeout(&SocketAddr::V4(peer), HANDSHAKE_TIMEOUT)?;
+        // A cell is 514 bytes and is usually the only thing to send; waiting
+        // for Nagle to accumulate more would add a round trip to every
+        // handshake and every request.
+        if let Err(e) = sock.set_nodelay(true) {
+            debug!("{peer}: could not disable Nagle: {e}");
+        }
         let mut tls = SslStream::connect(sock, HANDSHAKE_TIMEOUT)?;
         let tls_cert_sha256 = *tls.peer_cert_sha256();
 

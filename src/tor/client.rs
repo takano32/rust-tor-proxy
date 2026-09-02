@@ -27,14 +27,13 @@ use super::hs::descriptor::{self, Descriptor};
 use super::hs::hsdir::{self, RingNode};
 use super::hs::rendezvous;
 use super::path::{self, PathConstraints};
+use super::pool::{self, Pool, Stub, MAX_CIRCUITS};
 use super::RelayInfo;
 use crate::ffi::rand;
 use crate::util::{base64_encode_unpadded, hex_decode, hex_encode, invalid_data};
 
-/// Retire a circuit this long after it was built.
+/// Retire a rendezvous circuit this long after it was built.
 const MAX_CIRCUIT_AGE: Duration = Duration::from_secs(600);
-/// Never keep more than this many circuits alive at once.
-const MAX_CIRCUITS: usize = 8;
 /// How many exit candidates to look at before filtering by port policy.
 const EXIT_SAMPLE: usize = 40;
 /// How many middle candidates to fetch microdescriptors for.
@@ -80,7 +79,8 @@ pub struct TorClient {
     directory: RwLock<Arc<Directory>>,
     state_dir: PathBuf,
     guards: Mutex<Guards>,
-    circuits: Mutex<Vec<PooledCircuit>>,
+    /// Circuits built ahead of time and the ones currently carrying streams.
+    pool: Pool,
     microdescs: Mutex<HashMap<[u8; 32], Arc<Microdesc>>>,
     /// Built the first time a `.onion` address is asked for, because it costs
     /// thousands of microdescriptors that a client with no onion traffic
@@ -229,12 +229,6 @@ impl Guards {
     }
 }
 
-struct PooledCircuit {
-    circuit: Circuit,
-    exit_policy: Arc<Microdesc>,
-    built: Instant,
-}
-
 impl TorClient {
     /// Bootstrap: get a verified consensus, then pick and pin a guard.
     ///
@@ -259,7 +253,7 @@ impl TorClient {
             directory: RwLock::new(Arc::new(directory)),
             state_dir,
             guards: Mutex::new(Guards { entries, open }),
-            circuits: Mutex::new(Vec::new()),
+            pool: Pool::new(),
             microdescs: Mutex::new(HashMap::new()),
             hsdir_ring: Mutex::new(None),
             hsdir_build: Mutex::new(()),
@@ -276,6 +270,7 @@ impl TorClient {
             channel.link_version()
         );
         super::maintain::spawn(&client);
+        pool::spawn(&client);
         Ok(client)
     }
 
@@ -298,6 +293,10 @@ impl TorClient {
         Directory::bootstrap(Cache::new(state_dir), DirCircuit::to_random_fallback)
     }
 
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     /// The current view of the network. Take a clone and use it; holding the
     /// lock across a circuit build would block every refresh behind it.
     pub fn directory(&self) -> Arc<Directory> {
@@ -315,6 +314,9 @@ impl TorClient {
         let summary = next.summary();
         *self.directory.write().unwrap() = Arc::new(next);
         *self.hsdir_ring.lock().unwrap() = None;
+        // Pre-built circuits were chosen from the old relay list; keep the
+        // ones already carrying traffic and start the stock again.
+        self.pool.clear();
         crate::info!("consensus updated: {summary}");
     }
 
@@ -342,7 +344,10 @@ impl TorClient {
     }
 
     /// Open a stream to `host:port` through a three-hop circuit.
-    pub fn connect(&self, host: &str, port: u16) -> io::Result<TorStream> {
+    pub fn connect(self: &Arc<Self>, host: &str, port: u16) -> io::Result<TorStream> {
+        // Remember the port even if this attempt fails: the builder uses the
+        // recent history to decide what a pre-built circuit should allow.
+        self.pool.note_port(port);
         let mut last: Option<io::Error> = None;
         for attempt in 0..CONNECT_ATTEMPTS {
             let circuit = match self.circuit_for(port) {
@@ -354,7 +359,19 @@ impl TorClient {
                 }
             };
             match circuit.begin_stream(host, port) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    // The BEGIN has gone but nothing has come back yet. If the
+                    // exit turns out to refuse this destination, or the
+                    // circuit dies, the stream moves itself to another one and
+                    // replays what the client has written meanwhile.
+                    let client = Arc::clone(self);
+                    let host = host.to_string();
+                    stream.set_reattach(Box::new(move |failed| {
+                        client.discard(failed);
+                        client.circuit_for(port)?.begin_stream(&host, port)
+                    }));
+                    return Ok(stream);
+                }
                 Err(e) => {
                     crate::debug!("attempt {}: BEGIN failed: {e}", attempt + 1);
                     // An exit policy rejection is about this exit, not the
@@ -367,107 +384,132 @@ impl TorClient {
         Err(last.unwrap_or_else(|| io::Error::other("could not open a stream")))
     }
 
-    /// A live circuit whose exit accepts `port`, reusing one if possible.
+    /// A live circuit whose exit accepts `port`, reusing one from the pool
+    /// when there is a suitable one that is not already busy.
     fn circuit_for(&self, port: u16) -> io::Result<Circuit> {
-        {
-            let mut pool = self.circuits.lock().unwrap();
-            pool.retain(|c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
-            if let Some(found) = pool.iter().find(|c| c.exit_policy.exit_policy.allows(port)) {
-                return Ok(found.circuit.clone());
-            }
+        if let Some(circuit) = self.pool.circuit_for(port) {
+            return Ok(circuit);
         }
-
-        let (circuit, exit_md) = self.build_circuit(port)?;
-        let mut pool = self.circuits.lock().unwrap();
-        pool.retain(|c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
-        while pool.len() >= MAX_CIRCUITS {
-            let oldest = pool.remove(0);
-            oldest.circuit.close();
-        }
-        pool.push(PooledCircuit {
-            circuit: circuit.clone(),
-            exit_policy: exit_md,
-            built: Instant::now(),
-        });
+        let (circuit, exit) = self.build_exit_circuit(&[port])?;
+        // Built to serve a request that is waiting, so it counts as dirty from
+        // this moment rather than from its first stream.
+        self.pool.insert(circuit.clone(), exit, true);
         Ok(circuit)
     }
 
     fn discard(&self, circuit: &Circuit) {
-        let mut pool = self.circuits.lock().unwrap();
-        pool.retain(|c| c.circuit.circ_id() != circuit.circ_id());
-        circuit.close();
+        self.pool.discard(circuit);
     }
 
-    fn build_circuit(&self, port: u16) -> io::Result<(Circuit, Arc<Microdesc>)> {
-        // Take the channel first: it decides which guard the path starts at.
+    /// A two-hop circuit -- guard, then a middle relay -- with its last hop
+    /// still to be chosen. Called by the builder thread.
+    pub fn build_stub(&self) -> io::Result<Stub> {
         let (channel, guard) = self.guard_channel()?;
-        let guard_identity = guard.rsa_identity;
-
         let mut constraints = PathConstraints::default();
-        let guard_md = self.cached_microdesc(&guard_identity);
-        if let Some(status) = self.router(&guard_identity) {
-            constraints.add(&status, guard_md.as_deref());
+        self.constrain(&mut constraints, &guard);
+        let middle = self.choose_middle(&constraints)?;
+
+        let circuit = Circuit::create(&channel, &guard)?;
+        if let Err(e) = circuit.extend(&middle) {
+            circuit.close();
+            return Err(e);
+        }
+        self.constrain(&mut constraints, &middle);
+        Ok(Stub::new(circuit, constraints))
+    }
+
+    /// A three-hop circuit whose exit allows `ports`, extending a waiting stub
+    /// if there is one.
+    pub fn build_exit_circuit(&self, ports: &[u16]) -> io::Result<(Circuit, Arc<Microdesc>)> {
+        // Any stub will do: the exit has not been chosen yet, so it can be
+        // chosen to fit whichever stub we get.
+        if let Some(stub) = self.pool.take_stub(&|_| true) {
+            match self.extend_to_exit(&stub, ports) {
+                Ok(exit) => return Ok((stub.circuit, exit)),
+                Err(e) => {
+                    crate::debug!("stub could not be extended to an exit: {e}");
+                    stub.circuit.close();
+                }
+            }
         }
 
-        // Sample exit and middle candidates together so their microdescriptors
-        // come back in one directory request.
-        let directory = self.directory();
-        let consensus = &directory.consensus;
-        let exit_pool = path::exit_candidates(consensus, &constraints);
-        let exits = path::sample(&exit_pool, EXIT_SAMPLE)?;
-        let middle_pool = path::middle_candidates(consensus, &constraints);
-        let middles = path::sample(&middle_pool, MIDDLE_SAMPLE)?;
+        let (channel, guard) = self.guard_channel()?;
+        let mut constraints = PathConstraints::default();
+        self.constrain(&mut constraints, &guard);
+        let middle = self.choose_middle(&constraints)?;
+        let circuit = Circuit::create(&channel, &guard)?;
+        let built = (|| {
+            circuit.extend(&middle)?;
+            self.constrain(&mut constraints, &middle);
+            let stub = Stub::new(circuit.clone(), constraints);
+            self.extend_to_exit(&stub, ports)
+        })();
+        match built {
+            Ok(exit) => Ok((circuit, exit)),
+            Err(e) => {
+                circuit.close();
+                Err(e)
+            }
+        }
+    }
 
-        let mut wanted: Vec<[u8; 32]> = Vec::with_capacity(exits.len() + middles.len());
-        wanted.extend(exits.iter().map(|r| r.microdesc_digest));
-        wanted.extend(middles.iter().map(|r| r.microdesc_digest));
+    /// Choose an exit that fits what is already on `stub` and allows `ports`,
+    /// and extend the circuit to it.
+    fn extend_to_exit(&self, stub: &Stub, ports: &[u16]) -> io::Result<Arc<Microdesc>> {
+        let directory = self.directory();
+        let candidates = path::exit_candidates(&directory.consensus, &stub.constraints);
+        let sampled = path::sample(&candidates, EXIT_SAMPLE)?;
+        let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
 
-        // Pick the exit first: its policy is the binding constraint.
-        let allowing: Vec<&RouterStatus> = exits
+        let usable = |r: &&RouterStatus, all: bool| {
+            fetched.get(&r.microdesc_digest).is_some_and(|md| {
+                !md.exit_policy.is_empty()
+                    && stub.constraints.accepts(r, Some(md))
+                    && if all {
+                        ports.iter().all(|p| md.exit_policy.allows(*p))
+                    } else {
+                        ports.iter().any(|p| md.exit_policy.allows(*p))
+                    }
+            })
+        };
+        // Prefer an exit that allows every predicted port, but do not give up
+        // if none does: one that allows some of them still serves most
+        // requests, and the rest get a circuit of their own.
+        let mut allowing: Vec<&RouterStatus> = sampled
             .iter()
             .copied()
-            .filter(|r| {
-                fetched
-                    .get(&r.microdesc_digest)
-                    .is_some_and(|md| !md.exit_policy.is_empty() && md.exit_policy.allows(port))
-            })
+            .filter(|r| usable(r, true))
             .collect();
         if allowing.is_empty() {
+            allowing = sampled
+                .iter()
+                .copied()
+                .filter(|r| usable(r, false))
+                .collect();
+        }
+        if allowing.is_empty() {
             return Err(invalid_data(format!(
-                "none of {} sampled exits allows port {port}",
-                exits.len()
+                "none of {} sampled exits allows any of {ports:?}",
+                sampled.len()
             )));
         }
+
         let exit = path::weighted_choice(&allowing)?;
         let exit_md = fetched
             .get(&exit.microdesc_digest)
             .cloned()
             .ok_or_else(|| invalid_data("exit microdescriptor vanished"))?;
-        constraints.add(exit, Some(&exit_md));
-
-        let middle_choices: Vec<&RouterStatus> = middles
-            .iter()
-            .copied()
-            .filter(|r| {
-                fetched
-                    .get(&r.microdesc_digest)
-                    .is_some_and(|md| constraints.accepts(r, Some(md)))
-            })
-            .collect();
-        let middle = path::weighted_choice(&middle_choices)?;
-        let middle_md = fetched
-            .get(&middle.microdesc_digest)
-            .cloned()
-            .ok_or_else(|| invalid_data("middle microdescriptor vanished"))?;
-
-        let circuit = extend_path(
-            &channel,
-            &guard,
-            &relay_info(middle, &middle_md),
-            &relay_info(exit, &exit_md),
-        )?;
-        Ok((circuit, exit_md))
+        stub.circuit.extend(&relay_info(exit, &exit_md))?;
+        crate::debug!(
+            "circuit {} completed to exit {}",
+            stub.circuit.circ_id(),
+            exit_md
+                .ed_identity
+                .map(|id| hex_encode(&id[..4]))
+                .unwrap_or_default()
+        );
+        Ok(exit_md)
     }
 
     /// Build a three-hop circuit that ends at a relay the caller names.
@@ -476,6 +518,32 @@ impl TorClient {
     /// the last hop is fixed by the protocol rather than chosen for its exit
     /// policy, and only the middle is ours to pick.
     pub fn build_circuit_to(&self, last: &RelayInfo) -> io::Result<Circuit> {
+        // A waiting stub is two of the three hops already done, so long as its
+        // middle does not clash with where we are going.
+        let family = self
+            .cached_microdesc(&last.rsa_identity)
+            .map(|md| md.family.clone())
+            .unwrap_or_default();
+        let octets = last.addr.ip().octets();
+        let subnet = [octets[0], octets[1]];
+        let fits = |c: &PathConstraints| c.accepts_relay(&last.rsa_identity, subnet, &family);
+        if let Some(stub) = self.pool.take_stub(&fits) {
+            match stub.circuit.extend(last) {
+                Ok(()) => {
+                    crate::debug!(
+                        "circuit {} completed to {} from a stub",
+                        stub.circuit.circ_id(),
+                        last.addr
+                    );
+                    return Ok(stub.circuit);
+                }
+                Err(e) => {
+                    crate::debug!("stub could not be extended to {}: {e}", last.addr);
+                    stub.circuit.close();
+                }
+            }
+        }
+
         let (channel, guard) = self.guard_channel()?;
         let mut constraints = PathConstraints::default();
         self.constrain(&mut constraints, &guard);
@@ -1063,7 +1131,11 @@ impl TorClient {
     }
 
     /// Open a stream to `address:port` through a rendezvous circuit.
-    pub fn connect_onion(&self, address: &OnionAddress, port: u16) -> io::Result<TorStream> {
+    pub fn connect_onion(
+        self: &Arc<Self>,
+        address: &OnionAddress,
+        port: u16,
+    ) -> io::Result<TorStream> {
         let mut last: Option<io::Error> = None;
         for attempt in 0..CONNECT_ATTEMPTS {
             let circuit = match self.onion_circuit(address) {
@@ -1082,7 +1154,17 @@ impl TorClient {
                 }
             };
             match circuit.begin_stream_onion(port) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    let client = Arc::clone(self);
+                    let address = *address;
+                    stream.set_reattach(Box::new(move |_failed| {
+                        // Only a circuit failure gets here: the service's own
+                        // refusals are about the destination, not the path.
+                        client.discard_onion_circuit(&address);
+                        client.onion_circuit(&address)?.begin_stream_onion(port)
+                    }));
+                    return Ok(stream);
+                }
                 // A RELAY_END means the service itself answered: it is not
                 // listening on that port. Another rendezvous circuit would
                 // reach the same service and get the same answer, so keep the
@@ -1105,6 +1187,7 @@ impl TorClient {
         {
             let mut open = self.onion_circuits.lock().unwrap();
             open.retain(|_, c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
+            self.pool.set_onion_in_use(open.len());
             if let Some(found) = open.get(&address.public_key) {
                 return Ok(found.circuit.clone());
             }
@@ -1151,18 +1234,16 @@ impl TorClient {
         ) {
             displaced.circuit.close();
         }
+        self.pool.set_onion_in_use(open.len());
         Ok(circuit)
     }
 
     fn discard_onion_circuit(&self, address: &OnionAddress) {
-        if let Some(retired) = self
-            .onion_circuits
-            .lock()
-            .unwrap()
-            .remove(&address.public_key)
-        {
+        let mut open = self.onion_circuits.lock().unwrap();
+        if let Some(retired) = open.remove(&address.public_key) {
             retired.circuit.close();
         }
+        self.pool.set_onion_in_use(open.len());
     }
 
     /// The blinded key and subcredential for this address in the current time
@@ -1271,6 +1352,15 @@ fn extend_path(
         last.addr
     );
     Ok(circuit)
+}
+
+impl Drop for TorClient {
+    fn drop(&mut self) {
+        // The builder and maintenance threads hold only weak references, so
+        // they would stop on their own; this makes them stop at once rather
+        // than at their next tick.
+        self.pool.stop();
+    }
 }
 
 /// Read `state/guards`: one guard per line, in priority order, as
@@ -1404,12 +1494,15 @@ mod live_tests {
 
         // The pooled circuit must be reused for a second request on the same
         // port rather than being rebuilt.
-        let before = client.circuits.lock().unwrap().len();
-        assert_eq!(before, 1);
+        let (_, circuits) = client.pool().counts();
         let second = client
             .connect("check.torproject.org", 80)
             .expect("second connect");
-        assert_eq!(client.circuits.lock().unwrap().len(), 1);
+        assert_eq!(
+            client.pool().counts().1,
+            circuits,
+            "a second stream on the same port must reuse a circuit"
+        );
         second.close();
 
         // The guard is pinned on disk, so a restart keeps the same one, and
