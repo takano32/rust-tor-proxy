@@ -102,7 +102,7 @@ draw, so these are medians of five runs unless stated.
 | `VmHWM` after bootstrap and a 2MB download | **17.3MB** |
 | `VmHWM` after also visiting an onion service | **31.4MB** |
 | `VmHWM` for a session that used all three protocols and an onion service | 35.2MB |
-| Threads | 5 idle (main, maintenance, circuit builder, guard channel I/O, circuit pump), plus one per SOCKS connection |
+| Threads | 5 idle, rising to about 15 once the circuit pool is stocked (one pump per circuit), plus one per SOCKS connection |
 | `TOR_STATE_DIR` after bootstrap | 4.1MB (3.6MB of it the consensus) |
 | `TOR_STATE_DIR` after one onion request | 25MB, and it stays there: microdescriptors the consensus no longer names are pruned |
 
@@ -201,6 +201,11 @@ Anonymity is weaker than the real Tor client. Specifically:
   proxy always has a reader parked on every connection it carries, so an idle
   SSH session and a black-holed circuit look identical until one of them is
   made to answer. Only a circuit that answers nothing is closed.
+- Up to sixteen circuits are kept, six of them finished and ready. The limit
+  is the network's rather than this client's — a pooled circuit costs about
+  30kB and one thread here, but relays cap circuit creation per client address
+  (dos-spec, `DoSCircuit*`), and every circuit is three volunteers holding
+  state for one user.
 - Among circuits that have not been thrown away, one is chosen at **random**
   rather than the fastest. Measured here, neither a circuit's round-trip time
   nor its exit's consensus bandwidth predicts the throughput it goes on to

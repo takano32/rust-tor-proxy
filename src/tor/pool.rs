@@ -32,10 +32,27 @@ use crate::ffi::rand;
 
 /// How many two-hop stubs to keep ready. Two covers a request arriving while
 /// another is being served without keeping much idle capacity around.
-const STUB_TARGET: usize = 2;
+const STUB_TARGET: usize = 3;
+
+/// How many circuits the builder raises at once.
+///
+/// Building one at a time is what actually limited the pool: a circuit takes
+/// three round trips, so filling a pool serially takes a minute or more, and
+/// after a guard change or a bad patch that is exactly when the circuits are
+/// wanted. Kept small so that the burst stays far inside what a relay will
+/// accept from one client.
+const BUILD_PARALLEL: usize = 3;
 
 /// Circuits of every kind that may exist at once.
-pub const MAX_CIRCUITS: usize = 8;
+///
+/// Not bounded by this client's resources: measured, a pooled circuit costs
+/// about 30kB and one thread, so scores of them would fit in the memory
+/// budget. It is bounded by the network's. A relay limits circuit creation per
+/// client address (dos-spec, `DoSCircuit*`; C Tor's defaults are three per
+/// second with a burst of ninety, and an hour's refusal past that), and every
+/// circuit here is three relays holding state for one client. A pool this size
+/// rebuilds at a fraction of a circuit per second even as circuits age out.
+pub const MAX_CIRCUITS: usize = 16;
 
 /// How many circuits concurrent streams spread across before they start
 /// sharing one. Each circuit gets its own thousand-cell window, so a parallel
@@ -50,7 +67,7 @@ const SPREAD_CIRCUITS: usize = 4;
 /// from those that have not proved bad, which spreads load, keeps one unlucky
 /// path from serving everything, and gives a bad one somewhere to be replaced
 /// from at once.
-const CLEAN_TARGET: usize = 3;
+const CLEAN_TARGET: usize = 6;
 
 /// A circuit that has delivered at least this much, over at least this much
 /// time actually spent receiving, has been measured; less than that and the
@@ -424,14 +441,14 @@ impl Pool {
     }
 
     /// Circuits with a reader that has been waiting long enough to be worth
-    /// testing, together with the guard each was built on.
-    pub fn wanting_probe(&self) -> Vec<(Circuit, [u8; 20])> {
+    /// testing.
+    pub fn wanting_probe(&self) -> Vec<Circuit> {
         let state = self.state.lock().unwrap();
         state
             .circuits
             .iter()
             .filter(|c| c.circuit.wants_probe())
-            .map(|c| (c.circuit.clone(), c.guard))
+            .map(|c| c.circuit.clone())
             .collect()
     }
 
@@ -570,7 +587,48 @@ impl Pool {
         counts
     }
 
-    /// What the builder should do next, if anything.
+    /// What the builder should do next, up to `limit` jobs at once.
+    ///
+    /// Counts the work the pool is short of rather than returning one job at a
+    /// time, so the builder can raise several circuits in parallel; the total
+    /// is still bounded by `MAX_CIRCUITS`, including whatever is already in
+    /// flight.
+    fn next_jobs(&self, ports: &[u16], limit: usize) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        let mut budget = match self.next_job(ports) {
+            None => return jobs,
+            Some(first) => {
+                jobs.push(first);
+                1
+            }
+        };
+        let state = self.state.lock().unwrap();
+        let clean = state
+            .open_for_streams()
+            .filter(|c| {
+                c.first_used.is_none() && ports.iter().all(|p| c.exit.exit_policy.allows(*p))
+            })
+            .count();
+        let mut clean_short = CLEAN_TARGET.saturating_sub(clean + 1);
+        let mut stubs_short = STUB_TARGET.saturating_sub(state.stubs.len());
+        let room = MAX_CIRCUITS.saturating_sub(state.total() + 1);
+        drop(state);
+
+        while budget < limit && jobs.len() < room + 1 && (clean_short > 0 || stubs_short > 0) {
+            // Alternate, so neither kind starves the other.
+            if stubs_short > 0 {
+                jobs.push(Job::Stub);
+                stubs_short -= 1;
+            } else {
+                jobs.push(Job::Clean);
+                clean_short -= 1;
+            }
+            budget += 1;
+        }
+        jobs
+    }
+
+    /// The single most useful thing to build next, if anything.
     fn next_job(&self, ports: &[u16]) -> Option<Job> {
         let mut state = self.state.lock().unwrap();
         let closing = state.retire();
@@ -655,23 +713,40 @@ fn run(client: Weak<TorClient>) {
         // that sleeps thirty seconds before building anything has missed the
         // request it was meant to be ready for.
         let ports = client.pool().predicted_ports();
-        let wait = match client.pool().next_job(&ports) {
-            None => BUILDER_TICK,
-            Some(job) => match build(&client, job, &ports) {
-                Ok(()) => {
-                    backoff = BUILD_RETRY_MIN;
-                    let (stubs, circuits) = client.pool().counts();
-                    crate::debug!("pool: {stubs} stubs, {circuits} circuits");
-                    // There may be more to do; come straight back round.
-                    Duration::from_millis(50)
-                }
-                Err(e) => {
+        let jobs = client.pool().next_jobs(&ports, BUILD_PARALLEL);
+        let wait = if jobs.is_empty() {
+            BUILDER_TICK
+        } else {
+            // Several at once: each is three round trips, and doing them one
+            // after another is what kept the pool thin.
+            let results: Vec<std::io::Result<()>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .into_iter()
+                    .map(|job| scope.spawn(|| build(&client, job, &ports)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(std::io::Error::other("builder thread panicked"))
+                        })
+                    })
+                    .collect()
+            });
+            if results.iter().any(|r| r.is_ok()) {
+                backoff = BUILD_RETRY_MIN;
+                let (stubs, circuits) = client.pool().counts();
+                crate::debug!("pool: {stubs} stubs, {circuits} circuits");
+                // There may be more to do; come straight back round.
+                Duration::from_millis(50)
+            } else {
+                for e in results.iter().filter_map(|r| r.as_ref().err()) {
                     crate::debug!("pre-building a circuit failed: {e}");
-                    let delay = backoff;
-                    backoff = (backoff * 2).min(BUILD_RETRY_MAX);
-                    delay
                 }
-            },
+                let delay = backoff;
+                backoff = (backoff * 2).min(BUILD_RETRY_MAX);
+                delay
+            }
         };
 
         let pool = client.pool();

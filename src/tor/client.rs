@@ -166,14 +166,18 @@ struct GuardEntry {
     identity: [u8; 20],
     /// When circuits on this guard were last thrown out as unusable.
     strikes: Vec<Instant>,
-    /// When this guard was moved off for producing bad circuits.
+    /// When this guard was moved off for producing bad circuits, as a unix
+    /// time so that it survives a restart.
     ///
     /// Separate from `failed_at`, which means "would not talk to us" and is
     /// retried after ten minutes. A guard demoted for being useless must not
     /// be reinstated on that timer -- it answers perfectly well, so the retry
     /// would always succeed and put the client straight back on it with the
-    /// change already counted against its cap.
-    demoted_at: Option<Instant>,
+    /// change already counted against its cap. Nor should a restart forget it:
+    /// the guard file is read before anything else, and without this the very
+    /// first circuit of a new run would go back to the guard the last run
+    /// decided was useless.
+    demoted_unix: Option<u64>,
     /// Where it was last reached, remembered across restarts so that the very
     /// first thing a new process does can be to reconnect to its guard --
     /// before it has a consensus to look the address up in.
@@ -202,8 +206,12 @@ impl GuardEntry {
     /// Whether this guard is still serving out a demotion for producing
     /// unusable circuits.
     fn is_demoted(&self) -> bool {
-        self.demoted_at
-            .is_some_and(|at| at.elapsed() < GUARD_STRIKE_WINDOW)
+        self.demoted_unix.is_some_and(|at| {
+            let now = now_unix();
+            // A clock that has gone backwards since the file was written must
+            // not make a demotion look eternal.
+            now >= at && now - at < GUARD_STRIKE_WINDOW.as_secs()
+        })
     }
 
     /// Open a channel from the remembered address alone.
@@ -771,7 +779,7 @@ impl TorClient {
                 identity: chosen,
                 contact: None,
                 strikes: Vec::new(),
-                demoted_at: None,
+                demoted_unix: None,
                 failed_at: None,
             });
         }
@@ -833,7 +841,7 @@ impl TorClient {
     /// left alone however quiet it is, which is what keeps an idle SSH
     /// session or a long-polling request alive.
     pub fn probe_quiet_circuits(&self) {
-        for (circuit, guard) in self.pool.wanting_probe() {
+        for circuit in self.pool.wanting_probe() {
             match circuit.probe(circuit::PROBE_TIMEOUT) {
                 Ok(()) => crate::debug!(
                     "circuit {} is quiet but alive; leaving it",
@@ -844,7 +852,6 @@ impl TorClient {
                         "circuit {} answers nothing ({e}); dropping it and everything on it",
                         circuit.circ_id()
                     );
-                    let _ = guard;
                     self.pool.condemn(&circuit);
                 }
             }
@@ -917,7 +924,7 @@ impl TorClient {
         );
         if let Some(entry) = guards.entries.iter_mut().find(|e| e.identity == identity) {
             entry.strikes.clear();
-            entry.demoted_at = Some(Instant::now());
+            entry.demoted_unix = Some(now_unix());
         }
         // Note: not `mark_failed`. That closes the channel, and every circuit
         // this client has runs over it -- including the ones carrying the
@@ -1664,7 +1671,7 @@ impl Drop for TorClient {
 }
 
 /// Read `state/guards`: one guard per line, in priority order, as
-/// `<RSA identity hex> [<ip:port> <Ed25519 identity hex>]`.
+/// `<RSA identity hex> [<ip:port> <Ed25519 identity hex> [demoted <unix>]]`.
 ///
 /// The contact fields are optional so that a hand-written file naming only a
 /// fingerprint still works; they are filled in the first time the guard is
@@ -1695,11 +1702,17 @@ fn load_guards(state_dir: &Path) -> Vec<GuardEntry> {
             let ed_identity = <[u8; 32]>::try_from(hex_decode(fields.next()?).ok()?).ok()?;
             Some(GuardContact { addr, ed_identity })
         })();
+        // `demoted <unix>`, when the last run moved off this guard for
+        // producing unusable circuits.
+        let demoted_unix = match (fields.next(), fields.next()) {
+            (Some("demoted"), Some(at)) => at.parse().ok(),
+            _ => None,
+        };
         entries.push(GuardEntry {
             identity,
             contact,
             strikes: Vec::new(),
-            demoted_at: None,
+            demoted_unix,
             failed_at: None,
         });
         if entries.len() == MAX_GUARDS {
@@ -1718,6 +1731,12 @@ fn serialize_guards(entries: &[GuardEntry]) -> String {
             out.push_str(&contact.addr.to_string());
             out.push(' ');
             out.push_str(&hex_encode(&contact.ed_identity));
+            // Only written alongside a contact, so that the fields stay
+            // positional and an older file still reads.
+            if let Some(at) = entry.demoted_unix {
+                out.push_str(" demoted ");
+                out.push_str(&at.to_string());
+            }
         }
         out.push('\n');
     }
@@ -1809,12 +1828,53 @@ mod tests {
     // back as primary with the change already counted against the cap.
     const _: () = assert!(GUARD_STRIKE_WINDOW.as_secs() > GUARD_RETRY_INTERVAL.as_secs());
 
+    /// A demotion has to survive a restart, or the first circuit of the next
+    /// run goes straight back to the guard this run gave up on.
+    #[test]
+    fn a_demotion_round_trips_through_the_guard_file() {
+        let mut entry = entry(7);
+        entry.contact = Some(GuardContact {
+            addr: "10.0.0.1:9001".parse().unwrap(),
+            ed_identity: [0xcd; 32],
+        });
+        entry.demoted_unix = Some(now_unix());
+        let text = serialize_guards(&[entry]);
+        assert!(text.contains(" demoted "), "{text}");
+
+        let dir = std::env::temp_dir().join(format!("tor-guardfile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(GUARDS_FILE), &text).unwrap();
+        let loaded = load_guards(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].identity, [7u8; 20]);
+        assert!(loaded[0].is_demoted(), "the demotion must survive the file");
+        assert_eq!(loaded[0].contact.unwrap().addr.port(), 9001);
+
+        // A file from before this field still reads, and its guard is not
+        // demoted.
+        fs::write(
+            dir.join(GUARDS_FILE),
+            format!(
+                "{} 10.0.0.1:9001 {}\n",
+                hex_encode(&[7u8; 20]),
+                hex_encode(&[0xcdu8; 32])
+            ),
+        )
+        .unwrap();
+        let older = load_guards(&dir);
+        assert_eq!(older.len(), 1);
+        assert!(!older[0].is_demoted());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn entry(identity: u8) -> GuardEntry {
         GuardEntry {
             identity: [identity; 20],
             contact: None,
             strikes: Vec::new(),
-            demoted_at: None,
+            demoted_unix: None,
             failed_at: None,
         }
     }
@@ -1831,7 +1891,7 @@ mod tests {
 
         // Demoting the first hands the choice to the second.
         guards.stop_using(&[1u8; 20]);
-        guards.entries[0].demoted_at = Some(Instant::now());
+        guards.entries[0].demoted_unix = Some(now_unix());
         assert_eq!(guards.next_candidate(), Some([2u8; 20]));
 
         // And it stays demoted even once the connection-failure cool-off has
@@ -1843,13 +1903,13 @@ mod tests {
         // A demotion older than the window is forgotten: with nothing else to
         // fall back to, the guard is eligible again rather than the client
         // being left with none.
-        guards.entries[0].demoted_at = Some(Instant::now() - GUARD_STRIKE_WINDOW);
+        guards.entries[0].demoted_unix = Some(now_unix() - GUARD_STRIKE_WINDOW.as_secs());
         guards.entries.truncate(1);
         assert_eq!(guards.next_candidate(), Some([1u8; 20]));
 
         // While it is still demoted, though, having nothing else does not
         // bring it back -- `ensure_guard` adds a fresh guard instead.
-        guards.entries[0].demoted_at = Some(Instant::now());
+        guards.entries[0].demoted_unix = Some(now_unix());
         assert_eq!(guards.next_candidate(), None);
     }
 
