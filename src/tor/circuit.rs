@@ -2,10 +2,16 @@
 //! and stream multiplexing.
 //!
 //! One thread per circuit ("the pump") owns the receive side. It takes cells
-//! from the channel, peels one AES-CTR layer per hop until the running SHA-1
-//! digest recognises the cell, and hands the result to the right stream. Every
-//! piece of per-hop crypto lives behind a single mutex, so the pump and any
-//! number of writer threads take turns rather than racing.
+//! from the channel, peels one AES-CTR layer per hop until the running digest
+//! recognises the cell, and hands the result to the right stream. Every piece
+//! of per-hop crypto lives behind a single mutex, so the pump and any number
+//! of writer threads take turns rather than racing.
+//!
+//! A rendezvous circuit carries one hop more than it has relays: the onion
+//! service at the far end is a "virtual" hop, reached through the rendezvous
+//! point, whose layer uses AES-256 and SHA3-256 instead of AES-128 and SHA-1.
+//! Nothing else about relay cells changes, which is why the hop list simply
+//! holds a cipher and a digest rather than assuming either.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -17,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use super::cell::{self, Cell, CELL_BODY_LEN};
 use super::channel::Channel;
+use super::hs::ntor::HsCircuitKeys;
 use super::ntor::{self, CreateFastClient, NtorClient};
 use super::RelayInfo;
-use crate::ffi::aes::Aes128Ctr;
+use crate::ffi::aes::{Aes128Ctr, Aes256Ctr};
 use crate::ffi::hash::Digest;
 use crate::ffi::rand;
 use crate::util::invalid_data;
@@ -34,6 +41,11 @@ pub const RELAY_DROP: u8 = 10;
 pub const RELAY_BEGIN_DIR: u8 = 13;
 pub const RELAY_EXTEND2: u8 = 14;
 pub const RELAY_EXTENDED2: u8 = 15;
+pub const RELAY_ESTABLISH_RENDEZVOUS: u8 = 33;
+pub const RELAY_INTRODUCE1: u8 = 34;
+pub const RELAY_RENDEZVOUS2: u8 = 37;
+pub const RELAY_RENDEZVOUS_ESTABLISHED: u8 = 39;
+pub const RELAY_INTRODUCE_ACK: u8 = 40;
 
 /// Relay header: command, recognized, stream ID, digest, length.
 const RELAY_HEADER_LEN: usize = 11;
@@ -53,6 +65,10 @@ const MAX_RELAY_EARLY: u8 = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a blocked writer waits for a SENDME before giving up.
 const SENDME_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cap on queued control replies, so a relay that floods us with them cannot
+/// grow the queue without bound.
+const MAX_QUEUED_CONTROL: usize = 16;
 
 /// END reason codes (tor-spec/closing-streams.md).
 pub const END_REASON_MISC: u8 = 1;
@@ -83,23 +99,67 @@ pub fn end_reason_name(reason: u8) -> &'static str {
     }
 }
 
+/// A hop's stream cipher. Which one it is depends on the handshake that set
+/// the hop up, and on nothing else.
+enum HopCipher {
+    Aes128(Aes128Ctr),
+    Aes256(Aes256Ctr),
+}
+
+impl HopCipher {
+    fn apply(&mut self, buf: &mut [u8]) {
+        match self {
+            Self::Aes128(cipher) => cipher.apply(buf),
+            Self::Aes256(cipher) => cipher.apply(buf),
+        }
+    }
+}
+
 /// One hop's cryptographic state.
 struct Hop {
-    forward_cipher: Aes128Ctr,
-    backward_cipher: Aes128Ctr,
+    forward_cipher: HopCipher,
+    backward_cipher: HopCipher,
     forward_digest: Digest,
     backward_digest: Digest,
 }
 
 impl Hop {
+    /// An ordinary relay hop: AES-128-CTR and SHA-1.
     fn new(keys: &ntor::CircuitKeys) -> Self {
-        let mut forward_digest = Digest::sha1();
-        forward_digest.update(&keys.df);
-        let mut backward_digest = Digest::sha1();
-        backward_digest.update(&keys.db);
+        Self::build(
+            HopCipher::Aes128(Aes128Ctr::new(&keys.kf)),
+            HopCipher::Aes128(Aes128Ctr::new(&keys.kb)),
+            Digest::sha1(),
+            &keys.df,
+            &keys.db,
+        )
+    }
+
+    /// The onion service beyond a rendezvous point: AES-256-CTR and SHA3-256.
+    fn virtual_hop(keys: &HsCircuitKeys) -> Self {
+        Self::build(
+            HopCipher::Aes256(Aes256Ctr::new(&keys.kf)),
+            HopCipher::Aes256(Aes256Ctr::new(&keys.kb)),
+            Digest::sha3_256(),
+            &keys.df,
+            &keys.db,
+        )
+    }
+
+    fn build(
+        forward_cipher: HopCipher,
+        backward_cipher: HopCipher,
+        digest: Digest,
+        df: &[u8],
+        db: &[u8],
+    ) -> Self {
+        let mut forward_digest = digest.clone();
+        forward_digest.update(df);
+        let mut backward_digest = digest;
+        backward_digest.update(db);
         Self {
-            forward_cipher: Aes128Ctr::new(&keys.kf),
-            backward_cipher: Aes128Ctr::new(&keys.kb),
+            forward_cipher,
+            backward_cipher,
             forward_digest,
             backward_digest,
         }
@@ -116,9 +176,34 @@ struct State {
     next_stream_id: u16,
     /// Filled in by the pump when a CREATED2 or EXTENDED2 arrives.
     handshake: Option<Result<Vec<u8>, String>>,
+    /// Control-cell replies the pump has taken off the circuit, waiting for
+    /// whoever asked for them. A queue rather than a slot because a
+    /// RENDEZVOUS2 can arrive before the thread that wants it starts waiting.
+    control: VecDeque<(u8, Vec<u8>)>,
     /// Rolling digest of the last recognised inbound cell, which is what an
     /// authenticated (version 1) SENDME has to quote.
     last_recv_digest: [u8; 20],
+}
+
+impl State {
+    /// Queue a control reply for whoever is waiting on it. A peer that sends
+    /// more of these than anyone asked for loses the oldest rather than
+    /// growing the queue.
+    fn push_control(&mut self, relay_command: u8, data: Vec<u8>) {
+        if self.control.len() >= MAX_QUEUED_CONTROL {
+            self.control.pop_front();
+        }
+        self.control.push_back((relay_command, data));
+    }
+
+    /// Take the first queued reply with this command, leaving the others.
+    fn take_control(&mut self, relay_command: u8) -> Option<Vec<u8>> {
+        let index = self
+            .control
+            .iter()
+            .position(|(command, _)| *command == relay_command)?;
+        self.control.remove(index).map(|(_, data)| data)
+    }
 }
 
 struct Inner {
@@ -166,6 +251,7 @@ impl Circuit {
                 deliver_window: CIRCUIT_WINDOW_START,
                 next_stream_id: 1,
                 handshake: None,
+                control: VecDeque::new(),
                 last_recv_digest: [0u8; 20],
             }),
             event: Condvar::new(),
@@ -234,14 +320,7 @@ impl Circuit {
         let (client, skin) = NtorClient::new(&next.rsa_identity, &next.ntor_onion_key)?;
         let payload = build_extend2(next, &skin);
 
-        let last_hop = {
-            let state = self.inner.state.lock().unwrap();
-            state
-                .hops
-                .len()
-                .checked_sub(1)
-                .ok_or_else(|| invalid_data("cannot extend a circuit with no hops"))?
-        };
+        let last_hop = self.last_hop()?;
         self.send_relay(last_hop, RELAY_EXTEND2, 0, &payload, true)?;
 
         let reply = self.wait_for_handshake()?;
@@ -283,6 +362,75 @@ impl Circuit {
                 .unwrap();
             state = guard;
         }
+    }
+
+    /// Wait for one of the control-cell replies the pump queues.
+    ///
+    /// Unlike a handshake reply these are not tied to a request-response turn:
+    /// a RENDEZVOUS2 arrives when the service gets round to it, possibly
+    /// before this is even called, so the pump queues them and this takes the
+    /// first matching one.
+    pub fn wait_for_control(&self, relay_command: u8, timeout: Duration) -> io::Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.state.lock().unwrap();
+        loop {
+            if let Some(data) = state.take_control(relay_command) {
+                return Ok(data);
+            }
+            if self.is_closed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "circuit closed while waiting for a reply",
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for relay command {relay_command}"),
+                ));
+            }
+            let (guard, _) = self
+                .inner
+                .event
+                .wait_timeout(state, deadline - now)
+                .unwrap();
+            state = guard;
+        }
+    }
+
+    /// Send a control message to the far end of the circuit: stream ID zero,
+    /// last hop, never RELAY_EARLY.
+    pub fn send_control(&self, relay_command: u8, payload: &[u8]) -> io::Result<()> {
+        let hop = self.last_hop()?;
+        self.send_relay(hop, relay_command, 0, payload, false)
+    }
+
+    /// Add the onion service at the far end of a rendezvous circuit as a
+    /// further hop.
+    ///
+    /// It is not a relay we ever connected to -- the rendezvous point splices
+    /// the two circuits together -- but from here on its layer is applied and
+    /// stripped exactly like any other, so it belongs in the hop list.
+    pub fn add_virtual_hop(&self, keys: &HsCircuitKeys) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.hops.push(Hop::virtual_hop(keys));
+        debug!(
+            "circuit {}: virtual hop added, {} hops",
+            self.inner.circ_id,
+            state.hops.len()
+        );
+    }
+
+    fn last_hop(&self) -> io::Result<usize> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .hops
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid_data("this circuit has no hops"))
     }
 
     pub fn hop_count(&self) -> usize {
@@ -330,20 +478,22 @@ impl Circuit {
         self.open_stream(RELAY_BEGIN, addrport.as_bytes())
     }
 
+    /// Open a stream on a rendezvous circuit.
+    ///
+    /// The address is left empty: the service is the only thing at the far end
+    /// of this circuit, so there is nothing to name, and C Tor sends `:port`
+    /// alone here too.
+    pub fn begin_stream_onion(&self, port: u16) -> io::Result<TorStream> {
+        self.open_stream(RELAY_BEGIN, format!(":{port}\0").as_bytes())
+    }
+
     /// Open a stream to the relay's own directory cache.
     pub fn begin_dir_stream(&self) -> io::Result<TorStream> {
         self.open_stream(RELAY_BEGIN_DIR, &[])
     }
 
     fn open_stream(&self, relay_command: u8, payload: &[u8]) -> io::Result<TorStream> {
-        let hop = {
-            let state = self.inner.state.lock().unwrap();
-            state
-                .hops
-                .len()
-                .checked_sub(1)
-                .ok_or_else(|| invalid_data("cannot open a stream on a circuit with no hops"))?
-        };
+        let hop = self.last_hop()?;
         let stream_id = self.alloc_stream_id()?;
         let shared = Arc::new(StreamShared {
             id: stream_id,
@@ -791,6 +941,11 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
                 format!("circuit truncated, reason {reason}"),
             ));
         }
+        RELAY_RENDEZVOUS_ESTABLISHED | RELAY_INTRODUCE_ACK | RELAY_RENDEZVOUS2 => {
+            state.push_control(relay_command, data.to_vec());
+            drop(state);
+            inner.event.notify_all();
+        }
         RELAY_DROP => {}
         other => {
             trace!("circuit {}: ignoring relay command {other}", inner.circ_id);
@@ -1003,9 +1158,18 @@ mod tests {
         }
     }
 
-    /// The relay's view of one hop: the mirror image of ours.
+    fn hs_keys(seed: u8) -> HsCircuitKeys {
+        HsCircuitKeys {
+            df: [seed; 32],
+            db: [seed ^ 0xff; 32],
+            kf: [seed.wrapping_add(1); 32],
+            kb: [seed.wrapping_add(2); 32],
+        }
+    }
+
+    /// The far end's view of one hop: the mirror image of ours.
     struct PeerHop {
-        cipher_from_client: Aes128Ctr,
+        cipher_from_client: HopCipher,
         digest_from_client: Digest,
     }
 
@@ -1014,7 +1178,16 @@ mod tests {
             let mut digest = Digest::sha1();
             digest.update(&k.df);
             Self {
-                cipher_from_client: Aes128Ctr::new(&k.kf),
+                cipher_from_client: HopCipher::Aes128(Aes128Ctr::new(&k.kf)),
+                digest_from_client: digest,
+            }
+        }
+
+        fn virtual_hop(k: &HsCircuitKeys) -> Self {
+            let mut digest = Digest::sha3_256();
+            digest.update(&k.df);
+            Self {
+                cipher_from_client: HopCipher::Aes256(Aes256Ctr::new(&k.kf)),
                 digest_from_client: digest,
             }
         }
@@ -1028,6 +1201,7 @@ mod tests {
             deliver_window: CIRCUIT_WINDOW_START,
             next_stream_id: 1,
             handshake: None,
+            control: VecDeque::new(),
             last_recv_digest: [0u8; 20],
         }
     }
@@ -1129,6 +1303,112 @@ mod tests {
             .map(|h| h.backward_digest.peek_prefix::<20>())
             .collect();
         assert_eq!(before, after);
+    }
+
+    /// A rendezvous circuit's fourth hop is the service itself, with SHA3-256
+    /// and AES-256. Cells addressed to it must unwrap there, and only there,
+    /// exactly as for an ordinary hop.
+    #[test]
+    fn onion_layers_unwrap_at_a_virtual_hop() {
+        let relays = [keys(2), keys(60), keys(120)];
+        let service = hs_keys(7);
+        let mut state = state_with_hops(&relays);
+        state.hops.push(Hop::virtual_hop(&service));
+
+        let mut peers: Vec<PeerHop> = relays.iter().map(PeerHop::new).collect();
+        peers.push(PeerHop::virtual_hop(&service));
+
+        let target = 3usize;
+        let payload = b"onion service payload".to_vec();
+        let cell = build_relay_cell(
+            &mut state,
+            0x8000_0002,
+            target,
+            RELAY_DATA,
+            5,
+            &payload,
+            false,
+        )
+        .unwrap();
+
+        let mut body = cell.body.clone();
+        for peer in peers.iter_mut() {
+            peer.cipher_from_client.apply(&mut body);
+        }
+        assert_eq!(body[0], RELAY_DATA);
+        assert_eq!(&body[1..3], &[0, 0]);
+        assert_eq!(
+            &body[RELAY_HEADER_LEN..RELAY_HEADER_LEN + payload.len()],
+            &payload[..]
+        );
+
+        // The digest the service checks is the first four bytes of a
+        // SHA3-256, not of a SHA-1.
+        let mut claimed = [0u8; 4];
+        claimed.copy_from_slice(&body[5..9]);
+        body[5..9].fill(0);
+        peers[target].digest_from_client.update(&body);
+        assert_eq!(peers[target].digest_from_client.output_len(), 32);
+        assert_eq!(peers[target].digest_from_client.peek_prefix::<4>(), claimed);
+    }
+
+    /// The inbound path must recognise a cell from the virtual hop, and an
+    /// authenticated SENDME still quotes twenty bytes even though the digest
+    /// is longer.
+    #[test]
+    fn inbound_recognition_at_a_virtual_hop() {
+        let relays = [keys(4)];
+        let service = hs_keys(9);
+        let mut client = state_with_hops(&relays);
+        client.hops.push(Hop::virtual_hop(&service));
+        let mut peers = state_with_hops(&relays);
+        peers.hops.push(Hop::virtual_hop(&service));
+
+        let mut body = vec![0u8; CELL_BODY_LEN];
+        body[0] = RELAY_DATA;
+        body[3..5].copy_from_slice(&11u16.to_be_bytes());
+        body[9..11].copy_from_slice(&4u16.to_be_bytes());
+        body[RELAY_HEADER_LEN..RELAY_HEADER_LEN + 4].copy_from_slice(b"pong");
+        peers.hops[1].backward_digest.update(&body);
+        let digest = peers.hops[1].backward_digest.peek_prefix::<4>();
+        body[5..9].copy_from_slice(&digest);
+        peers.hops[1].backward_cipher.apply(&mut body);
+        peers.hops[0].backward_cipher.apply(&mut body);
+
+        let hop = decrypt_inbound(&mut client, &mut body).expect("recognised");
+        assert_eq!(hop, 1, "the cell came from the service");
+        assert_eq!(&body[RELAY_HEADER_LEN..RELAY_HEADER_LEN + 4], b"pong");
+        assert_eq!(
+            client.last_recv_digest,
+            client.hops[1].backward_digest.peek_prefix::<20>()
+        );
+    }
+
+    /// Control replies are taken by command rather than in arrival order,
+    /// because a RENDEZVOUS2 can turn up while an INTRODUCE_ACK is still
+    /// being waited for.
+    #[test]
+    fn control_replies_are_queued_and_taken_by_command() {
+        let mut state = state_with_hops(&[keys(1)]);
+        state.push_control(RELAY_RENDEZVOUS_ESTABLISHED, Vec::new());
+        state.push_control(RELAY_INTRODUCE_ACK, vec![0, 0]);
+        assert_eq!(state.take_control(RELAY_INTRODUCE_ACK), Some(vec![0, 0]));
+        assert_eq!(state.take_control(RELAY_INTRODUCE_ACK), None);
+        assert_eq!(
+            state.take_control(RELAY_RENDEZVOUS_ESTABLISHED),
+            Some(Vec::new())
+        );
+
+        // A flood must not grow the queue; the newest replies are the ones
+        // worth keeping.
+        for i in 0..MAX_QUEUED_CONTROL as u8 * 2 {
+            state.push_control(RELAY_RENDEZVOUS2, vec![i]);
+        }
+        assert_eq!(state.control.len(), MAX_QUEUED_CONTROL);
+        assert_eq!(
+            state.take_control(RELAY_RENDEZVOUS2),
+            Some(vec![MAX_QUEUED_CONTROL as u8])
+        );
     }
 
     #[test]

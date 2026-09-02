@@ -9,11 +9,26 @@ pub mod address;
 pub mod blind;
 pub mod descriptor;
 pub mod hsdir;
+pub mod ntor;
 
 /// `INT_8(x)`: the eight-byte big-endian encoding rend-spec writes that way.
 /// Not to be confused with tor-spec's one-byte `INT8`.
 pub fn int8(value: u64) -> [u8; 8] {
     value.to_be_bytes()
+}
+
+/// `MAC(key, msg) = H(INT_8(len(key)) | key | msg)`.
+///
+/// The key comes first, as in C Tor's `crypto_mac_sha3_256(out, key, msg)`.
+/// rend-spec writes calls like `MAC(rend_secret_hs_input, t_hsenc)`, where the
+/// long value is the key and the short tweak string is the message -- which
+/// reads backwards until you know that.
+pub fn mac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(8 + key.len() + msg.len());
+    input.extend_from_slice(&int8(key.len() as u64));
+    input.extend_from_slice(key);
+    input.extend_from_slice(msg);
+    crate::ffi::hash::sha3_256(&input)
 }
 
 #[cfg(test)]

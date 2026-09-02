@@ -80,7 +80,7 @@ impl EphemeralSecret {
 #[cfg(test)]
 impl EphemeralSecret {
     /// Rebuild a key pair from a known private scalar, for test vectors only.
-    fn from_raw_private(secret: &[u8; 32]) -> io::Result<Self> {
+    pub(crate) fn from_raw_private(secret: &[u8; 32]) -> io::Result<Self> {
         let pkey = unsafe {
             EVP_PKEY_new_raw_private_key(
                 EVP_PKEY_X25519,
