@@ -1069,7 +1069,7 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
 
 ### M16. 待ち時間ゼロ化: 事前構築、並列化、楽観応答
 
-- [ ] **回路プールとビルダースレッド(`tor/pool.rs`)**: 現在 `client.rs` にある
+- [x] **回路プールとビルダースレッド(`tor/pool.rs`)**: 現在 `client.rs` にある
       `circuits` / `onion_circuits` の管理をここへ移す。
   - **stub**: guard → middle の 2 ホップ回路。常に 2 本用意する。要求が来たら stub を取り、
     最後の 1 ホップ(exit / HSDir / IP / RP)だけ EXTEND2 する。middle が最後のホップと同一の
@@ -1080,11 +1080,11 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - **dirty 回路**: 使用中。dirtiness は **初回使用から** 10 分(現状は構築時から)。
   - ビルダーは `Condvar` で起こす(プールが減ったとき、コンセンサス差し替え、30 秒周期)。
     合計は `MAX_CIRCUITS`(8)のまま。stub を作れない(ガード断)ときは指数バックオフ。
-- [ ] **ストリームの分散**: 新しいストリームは「ポートを許す回路のうち開いているストリームが
+- [x] **ストリームの分散**: 新しいストリームは「ポートを許す回路のうち開いているストリームが
       最少のもの」に載せる。最少が 4 以上で上限未満なら stub から新しい回路を作り、以後の
       ストリームをそちらへ。window 方式では回路ごとに 1000 セル / RTT の上限があるので、
       並列ダウンロードの合計が回路数に比例して伸びる。
-- [ ] **楽観応答(optimistic data)**(`circuit.rs`, `socks5.rs`): コンセンサスは
+- [x] **楽観応答(optimistic data)**(`circuit.rs`, `socks5.rs`): コンセンサスは
       `UseOptimisticData=1`。tor-spec/opening-streams.md のとおり、CONNECTED を待たずに
       RELAY_DATA を送ってよい。
   - `Circuit::begin_stream` を「BEGIN を送ったら即 `TorStream` を返す」に変え、
@@ -1100,9 +1100,9 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - 失敗が SOCKS の応答コードでなく切断で見えるようになるので、END の理由を `info` で出す。
   - rendezvous 回路でも同じにする。サービス側が CONNECTED 前の DATA を受けなかった場合は
     実機で分かるので、そのときは onion だけ CONNECTED 待ちに戻す。
-- [ ] **TCP_NODELAY**: ガードチャネルの `TcpStream` と SOCKS クライアントの `TcpStream` に
+- [x] **TCP_NODELAY**: ガードチャネルの `TcpStream` と SOCKS クライアントの `TcpStream` に
       `set_nodelay(true)`。セル 1 個(514 バイト)の書き込みが Nagle で遅延しないようにする。
-- [ ] **`.onion` の並列化(`rendezvous.rs`, `client.rs`)**:
+- [x] **`.onion` の並列化(`rendezvous.rs`, `client.rs`)**:
   - RP 回路(stub から 1 ホップ + ESTABLISH_RENDEZVOUS)を別スレッドで作りながら、
     呼び出し元スレッドで IP 回路(stub から 1 ホップ)を作る。INTRODUCE1 は
     **RENDEZVOUS_ESTABLISHED を受けてから**送る(先に送るとサービスが RP に来たとき cookie が
@@ -1110,12 +1110,12 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - descriptor は担当 HSDir 2 台に同時に要求し、先に返った方を採る(stub 2 本消費)。
     もう一方の回路は閉じる。
   - リングは M15 で先読み済みなので、冷えた状態でも待つのは descriptor + RP / IP の分だけ。
-- [ ] **bandwidth-weights(`consensus.rs`, `path.rs`)**: `bandwidth-weights` 行を
+- [x] **bandwidth-weights(`consensus.rs`, `path.rs`)**: `bandwidth-weights` 行を
       `Params` と同様に読み、guard / middle / exit の位置ごとに `Wgg Wgm Wgd Wmg Wmm Wme Wmd
       Wee Wem Wed`(単位 1/10000)を掛けて `weighted_choice` する。速度には中立だが
       `path.rs` の TODO を解消し、本家と同じ分布になる。dir-spec/consensus-formats.md の
       bandwidth-weights と path-spec の重み付けの節を正とする。
-- [ ] 単体テスト: プールの状態遷移(stub 消費と補充、predicted ports の更新)、
+- [x] 単体テスト: プールの状態遷移(stub 消費と補充、predicted ports の更新)、
       楽観送信の再送バッファ(CONNECTED 前 END → 再送、上限超過 → 閉じる)、
       ストリーム分散の選択規則、bandwidth-weights の適用。
 - 完了条件(5 回の中央値): ready 後の初回 `curl https://check.torproject.org/api/ip` の

@@ -36,7 +36,15 @@ const STUB_TARGET: usize = 2;
 /// Circuits of every kind that may exist at once.
 pub const MAX_CIRCUITS: usize = 8;
 
-/// Once a circuit carries this many streams, a new one is worth building.
+/// How many circuits concurrent streams spread across before they start
+/// sharing one. Each circuit gets its own thousand-cell window, so a parallel
+/// download goes about as many times faster as it has circuits -- and this is
+/// the number that decides how many exits see the traffic at once, which is
+/// why it is a small constant and not the whole budget.
+const SPREAD_CIRCUITS: usize = 4;
+
+/// Once the spread is used up, a circuit takes this many streams before
+/// another is built.
 const STREAMS_PER_CIRCUIT: usize = 4;
 
 /// A circuit stops taking new streams this long after its first one, so that
@@ -211,12 +219,17 @@ impl Pool {
         let mut state = self.state.lock().unwrap();
         state.retire();
         let room = state.total() < MAX_CIRCUITS;
+        let allowing = state
+            .open_for_streams()
+            .filter(|c| c.exit.exit_policy.allows(port))
+            .count();
+        let limit = stream_limit(allowing);
         let best = state
             .circuits
             .iter_mut()
             .filter(|c| c.usable() && c.exit.exit_policy.allows(port))
             .min_by_key(|c| c.circuit.open_streams())?;
-        if best.circuit.open_streams() >= STREAMS_PER_CIRCUIT && room {
+        if best.circuit.open_streams() >= limit && room {
             return None;
         }
         best.first_used.get_or_insert_with(Instant::now);
@@ -352,6 +365,21 @@ impl Pool {
     }
 }
 
+/// How many streams a circuit takes before another is worth building, given
+/// how many already allow the port in question.
+///
+/// While there are few circuits each new stream gets one of its own, because
+/// that is what makes concurrent transfers add up; past the spread they share,
+/// because the budget is finite and every extra circuit is another exit
+/// watching this client's traffic.
+fn stream_limit(allowing: usize) -> usize {
+    if allowing < SPREAD_CIRCUITS {
+        1
+    } else {
+        STREAMS_PER_CIRCUIT
+    }
+}
+
 enum Job {
     Stub,
     Clean,
@@ -459,6 +487,23 @@ mod tests {
             state.predicted[0].last = Instant::now() - PREDICTION_WINDOW - Duration::from_secs(1);
         }
         assert_eq!(pool.predicted_ports(), vec![22]);
+    }
+
+    /// Four concurrent transfers should end up on four circuits, and only
+    /// then start sharing.
+    #[test]
+    fn streams_spread_before_they_stack() {
+        // A circuit already carrying a stream is passed over while the spread
+        // has room, which is what makes the caller build another.
+        for allowing in 0..SPREAD_CIRCUITS {
+            assert_eq!(stream_limit(allowing), 1, "with {allowing} circuits");
+        }
+        // Past the spread they are shared rather than multiplied.
+        assert_eq!(stream_limit(SPREAD_CIRCUITS), STREAMS_PER_CIRCUIT);
+        assert_eq!(stream_limit(MAX_CIRCUITS), STREAMS_PER_CIRCUIT);
+        // The spread has to fit inside the budget, or it could never be
+        // reached and streams would never be shared.
+        const _: () = assert!(SPREAD_CIRCUITS < MAX_CIRCUITS);
     }
 
     /// With nothing in it the pool always has work; once stocked it has none.

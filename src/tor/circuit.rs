@@ -988,12 +988,12 @@ pub type Reattach = Box<dyn Fn(&Circuit) -> io::Result<TorStream> + Send + Sync>
 /// of after the reply to it.
 ///
 /// The cost is that a refusal now arrives after the caller has been told the
-/// connection succeeded. For the one refusal that is about the exit rather
-/// than the destination -- EXITPOLICY -- and for a circuit that dies under
-/// the stream, the bytes written so far are replayed on a fresh circuit and
-/// the caller sees nothing. A refusal that is about the destination
-/// (CONNECTREFUSED, RESOLVEFAILED) would get the same answer anywhere, so it
-/// is passed straight through.
+/// connection succeeded. For the refusals that are about the exit rather than
+/// the destination, and for a circuit that dies under the stream, the bytes
+/// written so far are replayed on a fresh circuit and the caller sees
+/// nothing. Only a refusal that would be the same from anywhere --
+/// CONNECTREFUSED, which means the destination itself said no -- is passed
+/// straight through.
 pub struct TorStream {
     inner: Arc<StreamState>,
 }
@@ -1062,8 +1062,19 @@ impl TorStream {
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<StreamEnd>())
         {
-            // The exit will not carry this destination. Another one may.
-            Some(end) => end.0 == END_REASON_EXITPOLICY,
+            // These are all about the exit, not the destination, so another
+            // exit is worth a try. RESOLVEFAILED in particular: an exit with
+            // a broken resolver is common enough that C Tor retries it too,
+            // and the old blocking BEGIN used to retry it here as well.
+            // CONNECTREFUSED is the one the destination itself sent, and
+            // would come back the same from anywhere.
+            Some(end) => matches!(
+                end.0,
+                END_REASON_EXITPOLICY
+                    | END_REASON_RESOLVEFAILED
+                    | END_REASON_NOROUTE
+                    | END_REASON_TIMEOUT
+            ),
             // The circuit went away under us, which says nothing about the
             // destination.
             None => matches!(

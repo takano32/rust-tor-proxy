@@ -11,6 +11,7 @@
 //! client's circuit.
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::descriptor::{Descriptor, IntroPoint};
@@ -68,66 +69,137 @@ impl Failure {
     }
 }
 
+/// The rendezvous side: a circuit to a relay of our choosing, with a cookie
+/// left there for the service to quote back.
+struct Rendezvous {
+    circuit: Circuit,
+    point: RelayInfo,
+    cookie: [u8; 20],
+}
+
 /// Build a circuit that ends at the onion service.
 ///
 /// On success the returned circuit has four hops: guard, middle, rendezvous
 /// point, and the service itself as a virtual hop.
 pub fn establish(
-    client: &TorClient,
+    client: &Arc<TorClient>,
     descriptor: &Descriptor,
     subcredential: &[u8; 32],
 ) -> Result<Circuit, Failure> {
     let deadline = Instant::now() + TOTAL_TIMEOUT;
 
-    let rendezvous_point = client.choose_rendezvous_point().map_err(Failure::new)?;
-    let circuit = client
-        .build_circuit_to(&rendezvous_point)
-        .map_err(Failure::new)?;
+    // Nothing ties the two sides together until the INTRODUCE1 goes out, so
+    // build them at the same time. Two three-hop circuits raised one after the
+    // other is most of the wait on a cold `.onion`.
+    let rendezvous_thread = {
+        let client = Arc::clone(client);
+        std::thread::Builder::new()
+            .name("rendezvous".into())
+            .spawn(move || open_rendezvous(&client))
+    };
 
-    match establish_on(
+    let mut order: Vec<usize> = (0..descriptor.intro_points.len()).collect();
+    rand::shuffle(&mut order).map_err(Failure::new)?;
+    order.truncate(INTRO_ATTEMPTS);
+
+    // Meanwhile, get a circuit to the first introduction point ready.
+    let mut prepared = order.first().and_then(|&index| {
+        match client.build_circuit_to(&descriptor.intro_points[index].relay) {
+            Ok(circuit) => Some((index, circuit)),
+            Err(e) => {
+                crate::debug!("could not pre-build an introduction circuit: {e}");
+                None
+            }
+        }
+    });
+
+    let rendezvous = match rendezvous_thread {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the rendezvous thread stopped"))),
+        // Without a thread to run it on, do it here.
+        Err(e) => {
+            crate::debug!("could not start the rendezvous thread ({e}); doing it in line");
+            open_rendezvous(client)
+        }
+    };
+    let rendezvous = match rendezvous {
+        Ok(rendezvous) => rendezvous,
+        Err(e) => {
+            if let Some((_, circuit)) = prepared {
+                circuit.close();
+            }
+            return Err(Failure::new(e));
+        }
+    };
+
+    match introduce_until_met(
         client,
-        &circuit,
-        &rendezvous_point,
+        &rendezvous,
         descriptor,
         subcredential,
+        &order,
+        &mut prepared,
         deadline,
     ) {
-        Ok(()) => Ok(circuit),
+        Ok(()) => Ok(rendezvous.circuit),
         Err(failure) => {
-            circuit.close();
+            rendezvous.circuit.close();
+            if let Some((_, circuit)) = prepared {
+                circuit.close();
+            }
             Err(failure)
         }
     }
 }
 
-fn establish_on(
-    client: &TorClient,
-    circuit: &Circuit,
-    rendezvous_point: &RelayInfo,
-    descriptor: &Descriptor,
-    subcredential: &[u8; 32],
-    deadline: Instant,
-) -> Result<(), Failure> {
-    let cookie: [u8; 20] = rand::bytes().map_err(Failure::new)?;
-    circuit
-        .send_control(RELAY_ESTABLISH_RENDEZVOUS, &cookie)
-        .map_err(Failure::new)?;
-    circuit
-        .wait_for_control(RELAY_RENDEZVOUS_ESTABLISHED, ESTABLISH_TIMEOUT)
-        .map_err(Failure::new)?;
+/// Build the rendezvous circuit and leave the cookie at its far end.
+fn open_rendezvous(client: &Arc<TorClient>) -> io::Result<Rendezvous> {
+    let point = client.choose_rendezvous_point()?;
+    let circuit = client.build_circuit_to(&point)?;
+    let cookie: [u8; 20] = match rand::bytes() {
+        Ok(cookie) => cookie,
+        Err(e) => {
+            circuit.close();
+            return Err(e);
+        }
+    };
+    let established = (|| {
+        circuit.send_control(RELAY_ESTABLISH_RENDEZVOUS, &cookie)?;
+        circuit.wait_for_control(RELAY_RENDEZVOUS_ESTABLISHED, ESTABLISH_TIMEOUT)
+    })();
+    if let Err(e) = established {
+        circuit.close();
+        return Err(e);
+    }
     crate::debug!(
         "rendezvous point {} established on circuit {}",
-        rendezvous_point.addr,
+        point.addr,
         circuit.circ_id()
     );
+    Ok(Rendezvous {
+        circuit,
+        point,
+        cookie,
+    })
+}
 
-    let mut order: Vec<usize> = (0..descriptor.intro_points.len()).collect();
-    rand::shuffle(&mut order).map_err(Failure::new)?;
-
+/// Try the service's introduction points in turn until one of them puts us in
+/// touch with it.
+fn introduce_until_met(
+    client: &Arc<TorClient>,
+    rendezvous: &Rendezvous,
+    descriptor: &Descriptor,
+    subcredential: &[u8; 32],
+    order: &[usize],
+    prepared: &mut Option<(usize, Circuit)>,
+    deadline: Instant,
+) -> Result<(), Failure> {
     let mut last: Option<io::Error> = None;
     let mut all_unrecognized = true;
     let mut attempts = 0usize;
-    for index in order.into_iter().take(INTRO_ATTEMPTS) {
+
+    for &index in order {
         if Instant::now() >= deadline {
             last = Some(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -135,16 +207,17 @@ fn establish_on(
             ));
             break;
         }
+        // The circuit built while the rendezvous point was being set up, if
+        // this is the introduction point it was built for.
+        let ready = match prepared {
+            Some((prepared_index, _)) if *prepared_index == index => {
+                prepared.take().map(|(_, circuit)| circuit)
+            }
+            _ => None,
+        };
         let intro = &descriptor.intro_points[index];
         attempts += 1;
-        match introduce(
-            client,
-            circuit,
-            intro,
-            rendezvous_point,
-            &cookie,
-            subcredential,
-        ) {
+        match introduce(client, rendezvous, intro, subcredential, ready) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::debug!("introduction point {}: {e}", intro.relay.addr);
@@ -166,16 +239,15 @@ fn establish_on(
 /// One attempt through one introduction point: introduce ourselves, then wait
 /// for the service to turn up at the rendezvous point.
 fn introduce(
-    client: &TorClient,
-    rendezvous_circuit: &Circuit,
+    client: &Arc<TorClient>,
+    rendezvous: &Rendezvous,
     intro: &IntroPoint,
-    rendezvous_point: &RelayInfo,
-    cookie: &[u8; 20],
     subcredential: &[u8; 32],
+    ready: Option<Circuit>,
 ) -> io::Result<()> {
     let handshake = HsNtorClient::new(&intro.auth_key, &intro.enc_key)?;
     let keys = handshake.introduce_keys(subcredential);
-    let plaintext = introduce_plaintext(cookie, rendezvous_point);
+    let plaintext = introduce_plaintext(&rendezvous.cookie, &rendezvous.point);
     let message = assemble_introduce1(
         &intro.auth_key,
         &handshake.client_public(),
@@ -185,7 +257,10 @@ fn introduce(
 
     // The introduction circuit exists only to carry this one message, and is
     // closed as soon as it is acknowledged.
-    let intro_circuit = client.build_circuit_to(&intro.relay)?;
+    let intro_circuit = match ready {
+        Some(circuit) => circuit,
+        None => client.build_circuit_to(&intro.relay)?,
+    };
     let ack = (|| {
         intro_circuit.send_control(RELAY_INTRODUCE1, &message)?;
         intro_circuit.wait_for_control(RELAY_INTRODUCE_ACK, INTRODUCE_ACK_TIMEOUT)
@@ -193,12 +268,14 @@ fn introduce(
     intro_circuit.close();
     check_introduce_ack(&ack?)?;
 
-    let reply = rendezvous_circuit.wait_for_control(RELAY_RENDEZVOUS2, RENDEZVOUS_TIMEOUT)?;
+    let reply = rendezvous
+        .circuit
+        .wait_for_control(RELAY_RENDEZVOUS2, RENDEZVOUS_TIMEOUT)?;
     if reply.len() < SERVER_HANDSHAKE_LEN {
         return Err(invalid_data("RENDEZVOUS2 is too short to be a handshake"));
     }
     let circuit_keys = handshake.finish(&reply)?;
-    rendezvous_circuit.add_virtual_hop(&circuit_keys);
+    rendezvous.circuit.add_virtual_hop(&circuit_keys);
     Ok(())
 }
 

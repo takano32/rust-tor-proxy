@@ -68,6 +68,96 @@ impl RouterStatus {
     }
 }
 
+/// The scale the authorities publish bandwidth weights in: a weight of 10000
+/// means "count all of this relay's bandwidth". A consensus may in principle
+/// rescale them with the `bwweightscale` parameter, but the live network has
+/// only ever used the default, and rescaling every weight together does not
+/// change the proportions a draw is made on.
+pub const WEIGHT_SCALE: u32 = 10_000;
+
+/// The `bandwidth-weights` footer line: how much of a relay's bandwidth
+/// counts towards a draw, given the position it is drawn for and the Guard
+/// and Exit flags it holds (dir-spec/consensus-formats.md,
+/// "bandwidth-weights"; path-spec, "Weighting node selection"). Each value is
+/// a fraction of [`WEIGHT_SCALE`].
+///
+/// The line also carries the BEGIN_DIR weights (`Wbg`, `Wbd`, `Wgb`, ...);
+/// they are dropped with the rest of the text, because this client never
+/// draws a relay for a directory position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BandwidthWeights {
+    /// Guard position: Guard-flagged, unflagged, and Guard+Exit relays.
+    pub wgg: u32,
+    pub wgm: u32,
+    pub wgd: u32,
+    /// Middle position: Guard, unflagged, Exit, Guard+Exit.
+    pub wmg: u32,
+    pub wmm: u32,
+    pub wme: u32,
+    pub wmd: u32,
+    /// Exit position: Guard, unflagged, Exit, Guard+Exit.
+    pub weg: u32,
+    pub wem: u32,
+    pub wee: u32,
+    pub wed: u32,
+}
+
+/// Path-spec: a weight that is missing or malformed is taken as the full
+/// scale. Every weight at the scale leaves each relay's bandwidth untouched,
+/// so a consensus without the line is drawn from exactly as it was before the
+/// weights existed, rather than being reweighted by guesswork.
+impl Default for BandwidthWeights {
+    fn default() -> Self {
+        Self {
+            wgg: WEIGHT_SCALE,
+            wgm: WEIGHT_SCALE,
+            wgd: WEIGHT_SCALE,
+            wmg: WEIGHT_SCALE,
+            wmm: WEIGHT_SCALE,
+            wme: WEIGHT_SCALE,
+            wmd: WEIGHT_SCALE,
+            weg: WEIGHT_SCALE,
+            wem: WEIGHT_SCALE,
+            wee: WEIGHT_SCALE,
+            wed: WEIGHT_SCALE,
+        }
+    }
+}
+
+impl BandwidthWeights {
+    /// Parse a `bandwidth-weights` line in the same forgiving spirit as
+    /// [`Params::parse`]: unknown keys are skipped, and a value that cannot be
+    /// a weight -- negative, or above the scale, neither of which the
+    /// authorities' equations produce -- keeps its default. A weights line we
+    /// do not fully understand must never cost us the whole consensus.
+    fn parse(args: &str) -> Self {
+        let mut out = Self::default();
+        for field in args.split_whitespace() {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let Some(weight) = value.parse::<u32>().ok().filter(|v| *v <= WEIGHT_SCALE) else {
+                continue;
+            };
+            match key {
+                "Wgg" => out.wgg = weight,
+                "Wgm" => out.wgm = weight,
+                "Wgd" => out.wgd = weight,
+                "Wmg" => out.wmg = weight,
+                "Wmm" => out.wmm = weight,
+                "Wme" => out.wme = weight,
+                "Wmd" => out.wmd = weight,
+                "Weg" => out.weg = weight,
+                "Wem" => out.wem = weight,
+                "Wee" => out.wee = weight,
+                "Wed" => out.wed = weight,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 /// The consensus parameters this client reads (param-spec.md). Everything
 /// else on the `params` line is dropped with the rest of the text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,6 +168,11 @@ pub struct Params {
     pub hsdir_n_replicas: u8,
     /// How many nodes after each of those places a client may fetch from.
     pub hsdir_spread_fetch: usize,
+    /// The footer's `bandwidth-weights`. It rides on its own line rather than
+    /// on `params`, but it is read once per consensus and consulted for every
+    /// path just as the parameters are, so it is kept and filled alongside
+    /// them.
+    pub bandwidth_weights: BandwidthWeights,
 }
 
 impl Default for Params {
@@ -86,11 +181,25 @@ impl Default for Params {
             hsdir_interval: 1440,
             hsdir_n_replicas: 2,
             hsdir_spread_fetch: 3,
+            bandwidth_weights: BandwidthWeights::default(),
         }
     }
 }
 
 impl Params {
+    /// Everything the client reads outside the router entries: the `params`
+    /// line from the header and `bandwidth-weights` from the footer. Either
+    /// may be absent, in which case its defaults stand.
+    fn from_document(text: &str) -> Self {
+        let mut out = netdoc::item(text, "params")
+            .map(Self::parse)
+            .unwrap_or_default();
+        if let Some(args) = netdoc::item(text, "bandwidth-weights") {
+            out.bandwidth_weights = BandwidthWeights::parse(args);
+        }
+        out
+    }
+
     /// Parse a `params` line, keeping defaults for anything absent or out of
     /// the range the spec allows.
     fn parse(args: &str) -> Self {
@@ -137,6 +246,12 @@ pub struct Consensus {
 impl Consensus {
     pub fn is_live(&self, now: u64) -> bool {
         now < self.valid_until
+    }
+
+    /// The weights to draw relays with; neutral when the consensus carried
+    /// no `bandwidth-weights` line.
+    pub fn bandwidth_weights(&self) -> &BandwidthWeights {
+        &self.params.bandwidth_weights
     }
 
     pub fn count_with(&self, flags: u16) -> usize {
@@ -225,9 +340,7 @@ pub fn parse_and_verify(text: &str, certs: &[KeyCertificate], now: u64) -> io::R
         fresh_until,
         valid_until,
         routers,
-        params: netdoc::item(text, "params")
-            .map(Params::parse)
-            .unwrap_or_default(),
+        params: Params::from_document(text),
         shared_rand_current: shared_random(text, "shared-rand-current-value"),
         shared_rand_previous: shared_random(text, "shared-rand-previous-value"),
     })
@@ -520,5 +633,60 @@ mod tests {
         // No algorithm named means sha1.
         assert_eq!(found[1].algorithm, "sha1");
         assert_eq!(found[1].identity[..2], [0xee, 0xff]);
+    }
+
+    /// The line the authorities published on 2026-09-02, keys in the lexical
+    /// order the spec asks for.
+    const LIVE_WEIGHTS: &str = "Wbd=103 Wbe=0 Wbg=3987 Wbm=10000 Wdb=10000 \
+         Web=10000 Wed=9793 Wee=10000 Weg=9793 Wem=10000 Wgb=10000 Wgd=103 \
+         Wgg=6013 Wgm=6013 Wmb=10000 Wmd=103 Wme=0 Wmg=3987 Wmm=10000";
+
+    #[test]
+    fn parses_a_live_bandwidth_weights_line() {
+        let w = BandwidthWeights::parse(LIVE_WEIGHTS);
+        assert_eq!((w.wgg, w.wgm, w.wgd), (6013, 6013, 103));
+        assert_eq!((w.wmg, w.wmm, w.wme, w.wmd), (3987, 10000, 0, 103));
+        assert_eq!((w.weg, w.wem, w.wee, w.wed), (9793, 10000, 10000, 9793));
+    }
+
+    /// Absent, malformed and unknown all mean "leave it at the scale", and a
+    /// bad field must not swallow the ones that follow it.
+    #[test]
+    fn absent_or_malformed_weights_fall_back_to_the_scale() {
+        let neutral = BandwidthWeights::default();
+        assert_eq!(neutral.wgg, WEIGHT_SCALE);
+        assert_eq!(neutral.wed, WEIGHT_SCALE);
+        assert_eq!(BandwidthWeights::parse(""), neutral);
+
+        let w = BandwidthWeights::parse("Wgg=-1 Wgd=10001 Wmg=lots Wmm= Wee Wbd=5 Wme=250 Wmd=0");
+        assert_eq!(w.wgg, WEIGHT_SCALE, "a negative value is not a weight");
+        assert_eq!(w.wgd, WEIGHT_SCALE, "above the scale is not a weight");
+        assert_eq!(w.wmg, WEIGHT_SCALE);
+        assert_eq!(w.wmm, WEIGHT_SCALE, "an empty value is not a weight");
+        assert_eq!(w.wee, WEIGHT_SCALE, "a key with no value is not a weight");
+        // Everything after the malformed fields is still read, and zero is a
+        // weight the authorities really do publish.
+        assert_eq!(w.wme, 250);
+        assert_eq!(w.wmd, 0);
+    }
+
+    /// The weights sit in the footer and the parameters in the header; both
+    /// are read from the one document, and neither disturbs the other.
+    #[test]
+    fn the_weights_are_read_from_the_footer() {
+        let doc = sample("directory-signature x y\n");
+        assert_eq!(
+            Params::from_document(&doc).bandwidth_weights,
+            BandwidthWeights::default()
+        );
+
+        let with_weights = doc.replace(
+            "directory-footer\n",
+            &format!("directory-footer\nbandwidth-weights {LIVE_WEIGHTS}\n"),
+        );
+        let params = Params::from_document(&with_weights);
+        assert_eq!(params.bandwidth_weights.wgg, 6013);
+        assert_eq!(params.bandwidth_weights.wgd, 103);
+        assert_eq!(params.hsdir_interval, Params::default().hsdir_interval);
     }
 }

@@ -1,21 +1,19 @@
 //! Path selection.
 //!
 //! This is deliberately simpler than path-spec: relays are chosen in
-//! proportion to their consensus bandwidth, with the position-dependent
-//! `bandwidth-weights` ignored, and the guard is a single relay pinned until
-//! it stops working. What it does enforce is the structural part -- distinct
-//! relays, distinct /16s, and no two relays that declare each other as family
-//! in one circuit -- and a guard that does not change per circuit, which is
-//! the property that matters most for a client's anonymity.
-//!
-//! TODO: apply the consensus `bandwidth-weights` (Wgg/Wmg/Wee and friends) so
-//! that guard and exit capacity is not over-drawn from the same relays.
+//! proportion to their consensus bandwidth, scaled by the consensus
+//! `bandwidth-weights` for the position being filled, and the guard is a
+//! single relay pinned until it stops working. What it does enforce is the
+//! structural part -- distinct relays, distinct /16s, and no two relays that
+//! declare each other as family in one circuit -- and a guard that does not
+//! change per circuit, which is the property that matters most for a client's
+//! anonymity.
 
 use std::io;
 
 use super::dir::consensus::{
-    Consensus, RouterStatus, FLAG_BAD_EXIT, FLAG_EXIT, FLAG_FAST, FLAG_GUARD, FLAG_MIDDLE_ONLY,
-    FLAG_RUNNING, FLAG_STABLE, FLAG_VALID,
+    BandwidthWeights, Consensus, RouterStatus, FLAG_BAD_EXIT, FLAG_EXIT, FLAG_FAST, FLAG_GUARD,
+    FLAG_MIDDLE_ONLY, FLAG_RUNNING, FLAG_STABLE, FLAG_VALID, WEIGHT_SCALE,
 };
 use super::dir::microdesc::Microdesc;
 use crate::ffi::rand;
@@ -93,15 +91,103 @@ impl PathConstraints {
     }
 }
 
-/// Choose one relay in proportion to its consensus bandwidth.
+/// The place in a circuit a relay is being drawn for. The authorities weight
+/// a relay differently in each, so that the relays which could serve as
+/// either guard or exit are not drawn away from the position where they are
+/// scarce (path-spec, "Weighting node selection").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Position {
+    Guard,
+    Middle,
+    Exit,
+}
+
+impl Position {
+    /// The weight this position gives `router`, from the table in
+    /// dir-spec/consensus-formats.md ("bandwidth-weights") and path-spec
+    /// ("Weighting node selection"):
+    ///
+    /// ```text
+    ///                    Guard+Exit   Guard   Exit   neither
+    ///   guard position       Wgd       Wgg     --      Wgm
+    ///   middle position      Wmd       Wmg    Wme      Wmm
+    ///   exit position        Wed       Weg    Wee      Wem
+    /// ```
+    ///
+    /// The spec names no guard-position weight for an Exit-flagged relay that
+    /// is not also a Guard: such a relay is not a guard candidate at all, and
+    /// `guard_candidates` never offers one. It falls back to Wgm, which the
+    /// authorities set equal to Wgg to "handle bridges and strange exit
+    /// policies" -- the same treatment every other unflagged relay gets.
+    fn weight(self, router: &RouterStatus, weights: &BandwidthWeights) -> u32 {
+        let guard = router.has(FLAG_GUARD);
+        let exit = router.has(FLAG_EXIT);
+        match (self, guard, exit) {
+            (Position::Guard, true, true) => weights.wgd,
+            (Position::Guard, true, false) => weights.wgg,
+            (Position::Guard, false, _) => weights.wgm,
+            (Position::Middle, true, true) => weights.wmd,
+            (Position::Middle, true, false) => weights.wmg,
+            (Position::Middle, false, true) => weights.wme,
+            (Position::Middle, false, false) => weights.wmm,
+            (Position::Exit, true, true) => weights.wed,
+            (Position::Exit, true, false) => weights.weg,
+            (Position::Exit, false, true) => weights.wee,
+            (Position::Exit, false, false) => weights.wem,
+        }
+    }
+}
+
+/// A relay's share of an unweighted draw.
 ///
 /// A relay with zero bandwidth still gets a small share, so that a consensus
 /// where measurements are missing does not collapse to a single candidate.
+fn bandwidth_share(router: &RouterStatus) -> u64 {
+    router.bandwidth.max(1) as u64
+}
+
+/// A relay's share of a draw for `position`.
+fn weighted_bandwidth(
+    router: &RouterStatus,
+    position: Position,
+    weights: &BandwidthWeights,
+) -> u64 {
+    // Bandwidth is a u32 and a weight reaches 10000, so the product needs 64
+    // bits. The same floor as the unweighted share applies afterwards: a
+    // relay the weights push down to nothing stays selectable, which is what
+    // keeps a draw from failing when such a relay is the only candidate left.
+    let scaled = bandwidth_share(router) * position.weight(router, weights) as u64;
+    (scaled / WEIGHT_SCALE as u64).max(1)
+}
+
+/// Choose one relay in proportion to its consensus bandwidth alone.
+///
+/// Every position in a real path is weighted, so this is only the reference
+/// the tests below compare the weighted draw against: a consensus carrying no
+/// `bandwidth-weights` line must reduce to exactly this, since every weight
+/// then stands at the scale.
+#[cfg(test)]
 pub fn weighted_choice<'a>(candidates: &[&'a RouterStatus]) -> io::Result<&'a RouterStatus> {
+    choose(candidates, bandwidth_share)
+}
+
+/// Choose one relay for `position`, in proportion to its consensus bandwidth
+/// as the consensus weights it there.
+pub fn weighted_choice_at<'a>(
+    candidates: &[&'a RouterStatus],
+    position: Position,
+    weights: &BandwidthWeights,
+) -> io::Result<&'a RouterStatus> {
+    choose(candidates, |r| weighted_bandwidth(r, position, weights))
+}
+
+fn choose<'a>(
+    candidates: &[&'a RouterStatus],
+    weight: impl Fn(&RouterStatus) -> u64,
+) -> io::Result<&'a RouterStatus> {
     if candidates.is_empty() {
         return Err(invalid_data("no relay matches the required flags"));
     }
-    let weight = |r: &RouterStatus| r.bandwidth.max(1) as u64;
     let total: u64 = candidates.iter().map(|r| weight(r)).sum();
     let mut pick = rand::below(total)?;
     for router in candidates {
@@ -167,15 +253,38 @@ pub fn middle_candidates<'a>(
         .collect()
 }
 
-/// Draw `count` distinct relays without replacement, weighted by bandwidth.
+/// Draw `count` distinct relays without replacement, weighted by bandwidth
+/// alone. The unweighted reference, as `weighted_choice` above.
+#[cfg(test)]
 pub fn sample<'a>(
     candidates: &[&'a RouterStatus],
     count: usize,
 ) -> io::Result<Vec<&'a RouterStatus>> {
+    sample_with(candidates, count, bandwidth_share)
+}
+
+/// Draw `count` distinct relays without replacement, weighted for the
+/// position they are being sampled for.
+pub fn sample_at<'a>(
+    candidates: &[&'a RouterStatus],
+    count: usize,
+    position: Position,
+    weights: &BandwidthWeights,
+) -> io::Result<Vec<&'a RouterStatus>> {
+    sample_with(candidates, count, |r| {
+        weighted_bandwidth(r, position, weights)
+    })
+}
+
+fn sample_with<'a>(
+    candidates: &[&'a RouterStatus],
+    count: usize,
+    weight: impl Fn(&RouterStatus) -> u64,
+) -> io::Result<Vec<&'a RouterStatus>> {
     let mut pool: Vec<&RouterStatus> = candidates.to_vec();
     let mut out = Vec::with_capacity(count.min(pool.len()));
     while out.len() < count && !pool.is_empty() {
-        let chosen = weighted_choice(&pool)?;
+        let chosen = choose(&pool, &weight)?;
         let identity = chosen.identity;
         out.push(chosen);
         pool.retain(|r| r.identity != identity);
@@ -310,6 +419,164 @@ mod tests {
         assert!(weighted_choice(&[]).is_err());
     }
 
+    /// The weights the authorities published on 2026-09-02, when exit
+    /// bandwidth was the scarce resource.
+    fn live_weights() -> BandwidthWeights {
+        BandwidthWeights {
+            wgg: 6013,
+            wgm: 6013,
+            wgd: 103,
+            wmg: 3987,
+            wmm: 10000,
+            wme: 0,
+            wmd: 103,
+            weg: 9793,
+            wem: 10000,
+            wee: 10000,
+            wed: 9793,
+        }
+    }
+
+    /// Every entry of the spec's table, with distinct values so that a
+    /// transposed pair cannot pass.
+    #[test]
+    fn the_weight_table_follows_the_spec() {
+        let w = BandwidthWeights {
+            wgg: 1,
+            wgm: 2,
+            wgd: 3,
+            wmg: 4,
+            wmm: 5,
+            wme: 6,
+            wmd: 7,
+            weg: 8,
+            wem: 9,
+            wee: 10,
+            wed: 11,
+        };
+        let guard = router(1, [1, 1, 1, 1], USABLE | FLAG_GUARD, 1);
+        let exit = router(2, [2, 2, 2, 2], USABLE | FLAG_EXIT, 1);
+        let both = router(3, [3, 3, 3, 3], USABLE | FLAG_GUARD | FLAG_EXIT, 1);
+        let neither = router(4, [4, 4, 4, 4], USABLE, 1);
+
+        assert_eq!(Position::Guard.weight(&guard, &w), 1);
+        assert_eq!(Position::Guard.weight(&neither, &w), 2);
+        assert_eq!(Position::Guard.weight(&both, &w), 3);
+
+        assert_eq!(Position::Middle.weight(&guard, &w), 4);
+        assert_eq!(Position::Middle.weight(&neither, &w), 5);
+        assert_eq!(Position::Middle.weight(&exit, &w), 6);
+        assert_eq!(Position::Middle.weight(&both, &w), 7);
+
+        assert_eq!(Position::Exit.weight(&guard, &w), 8);
+        assert_eq!(Position::Exit.weight(&neither, &w), 9);
+        assert_eq!(Position::Exit.weight(&exit, &w), 10);
+        assert_eq!(Position::Exit.weight(&both, &w), 11);
+
+        // The one combination the spec leaves out.
+        assert_eq!(Position::Guard.weight(&exit, &w), 2);
+    }
+
+    /// Wgd is about a sixtieth of Wgg in this consensus, so a Guard+Exit relay must
+    /// lose the guard draw to an equally fast Guard-only one -- while the
+    /// unweighted draw between the same two stays a coin flip.
+    #[test]
+    fn weighting_steers_the_guard_draw_away_from_exits() {
+        let weights = live_weights();
+        let guard = router(1, [1, 1, 1, 1], GUARD_FLAGS, 10_000);
+        let dual = router(2, [2, 2, 2, 2], GUARD_FLAGS | FLAG_EXIT, 10_000);
+        let candidates = vec![&guard, &dual];
+
+        let mut weighted_hits = 0;
+        let mut plain_hits = 0;
+        for _ in 0..300 {
+            if weighted_choice_at(&candidates, Position::Guard, &weights)
+                .unwrap()
+                .identity[0]
+                == 1
+            {
+                weighted_hits += 1;
+            }
+            if weighted_choice(&candidates).unwrap().identity[0] == 1 {
+                plain_hits += 1;
+            }
+        }
+        // 6013 against 103 is about 98% of draws.
+        assert!(
+            weighted_hits > 270,
+            "guard-only relay chosen {weighted_hits}/300 times"
+        );
+        assert!(
+            (100..=200).contains(&plain_hits),
+            "unweighted draw gave {plain_hits}/300"
+        );
+    }
+
+    /// Wme is zero here: an Exit-flagged relay contributes nothing to the
+    /// middle position. It must still be selectable when it is all there is,
+    /// the same guarantee the floor gives a zero-bandwidth relay.
+    #[test]
+    fn a_relay_weighted_to_nothing_is_still_reachable() {
+        let weights = live_weights();
+        let exit = router(1, [1, 1, 1, 1], USABLE | FLAG_EXIT | FLAG_FAST, 50_000);
+        assert_eq!(weighted_bandwidth(&exit, Position::Middle, &weights), 1);
+
+        let only = vec![&exit];
+        assert_eq!(
+            weighted_choice_at(&only, Position::Middle, &weights)
+                .unwrap()
+                .identity[0],
+            1
+        );
+        assert_eq!(
+            sample_at(&only, 3, Position::Middle, &weights)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(weighted_choice_at(&[], Position::Middle, &weights).is_err());
+    }
+
+    /// A consensus with no `bandwidth-weights` line must be drawn from
+    /// exactly as the unweighted function draws it: same share for every
+    /// flag combination in every position, and the same distribution.
+    #[test]
+    fn neutral_weights_reproduce_the_unweighted_draw() {
+        let weights = BandwidthWeights::default();
+        let flags = [
+            USABLE,
+            USABLE | FLAG_GUARD,
+            USABLE | FLAG_EXIT,
+            USABLE | FLAG_GUARD | FLAG_EXIT,
+        ];
+        for (i, f) in flags.iter().enumerate() {
+            for bandwidth in [0, 1, 3, 1_000_000, u32::MAX] {
+                let r = router(i as u8, [1, 2, 3, 4], *f, bandwidth);
+                for position in [Position::Guard, Position::Middle, Position::Exit] {
+                    assert_eq!(
+                        weighted_bandwidth(&r, position, &weights),
+                        bandwidth_share(&r)
+                    );
+                }
+            }
+        }
+
+        let heavy = router(1, [1, 1, 1, 1], GUARD_FLAGS, 100_000);
+        let light = router(2, [2, 2, 2, 2], GUARD_FLAGS, 1);
+        let candidates = vec![&heavy, &light];
+        let mut hits = 0;
+        for _ in 0..300 {
+            if weighted_choice_at(&candidates, Position::Guard, &weights)
+                .unwrap()
+                .identity[0]
+                == 1
+            {
+                hits += 1;
+            }
+        }
+        assert!(hits > 280, "heavy relay chosen {hits}/300 times");
+    }
+
     #[test]
     fn sampling_never_repeats_a_relay() {
         let routers: Vec<RouterStatus> = (1..=10)
@@ -324,5 +591,12 @@ mod tests {
         assert_eq!(ids.len(), 6);
         // Asking for more than exist yields everything, once.
         assert_eq!(sample(&candidates, 50).unwrap().len(), 10);
+
+        // The weighted sample is drawn from the same pool in the same way.
+        let drawn = sample_at(&candidates, 6, Position::Exit, &live_weights()).unwrap();
+        let mut ids: Vec<u8> = drawn.iter().map(|r| r.identity[0]).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6);
     }
 }

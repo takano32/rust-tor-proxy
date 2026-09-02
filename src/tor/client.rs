@@ -53,6 +53,9 @@ const GUARD_ATTEMPTS: usize = 5;
 /// giving up -- unless every one of them answered "not here", in which case
 /// the rest are worth trying too (rend-spec's time-period boundary case).
 const HSDIR_TRIES: usize = 3;
+/// How many of them to ask at the same time. Two three-hop circuits cost
+/// little and the slower of the two no longer decides how long this takes.
+const HSDIR_PARALLEL: usize = 2;
 
 /// Where the chosen guards are remembered between runs, newest choice last.
 const GUARDS_FILE: &str = "guards";
@@ -457,8 +460,9 @@ impl TorClient {
     /// and extend the circuit to it.
     fn extend_to_exit(&self, stub: &Stub, ports: &[u16]) -> io::Result<Arc<Microdesc>> {
         let directory = self.directory();
+        let weights = directory.consensus.bandwidth_weights();
         let candidates = path::exit_candidates(&directory.consensus, &stub.constraints);
-        let sampled = path::sample(&candidates, EXIT_SAMPLE)?;
+        let sampled = path::sample_at(&candidates, EXIT_SAMPLE, path::Position::Exit, weights)?;
         let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
 
@@ -495,7 +499,7 @@ impl TorClient {
             )));
         }
 
-        let exit = path::weighted_choice(&allowing)?;
+        let exit = path::weighted_choice_at(&allowing, path::Position::Exit, weights)?;
         let exit_md = fetched
             .get(&exit.microdesc_digest)
             .cloned()
@@ -571,8 +575,9 @@ impl TorClient {
     /// Draw a middle relay that fits the constraints, with its onion key.
     fn choose_middle(&self, constraints: &PathConstraints) -> io::Result<RelayInfo> {
         let directory = self.directory();
+        let weights = directory.consensus.bandwidth_weights();
         let pool = path::middle_candidates(&directory.consensus, constraints);
-        let sampled = path::sample(&pool, MIDDLE_SAMPLE)?;
+        let sampled = path::sample_at(&pool, MIDDLE_SAMPLE, path::Position::Middle, weights)?;
         let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
         let usable: Vec<&RouterStatus> = sampled
@@ -584,7 +589,7 @@ impl TorClient {
                     .is_some_and(|md| constraints.accepts(r, Some(md)))
             })
             .collect();
-        let chosen = path::weighted_choice(&usable)?;
+        let chosen = path::weighted_choice_at(&usable, path::Position::Middle, weights)?;
         let md = fetched
             .get(&chosen.microdesc_digest)
             .ok_or_else(|| invalid_data("middle microdescriptor vanished"))?;
@@ -600,8 +605,11 @@ impl TorClient {
             self.constrain(&mut constraints, &guard);
         }
         let directory = self.directory();
+        let weights = directory.consensus.bandwidth_weights();
         let pool = path::rendezvous_candidates(&directory.consensus, &constraints);
-        let sampled = path::sample(&pool, RENDEZVOUS_SAMPLE)?;
+        // A rendezvous point forwards between two circuits and never exits,
+        // so it is drawn with the middle position's weights.
+        let sampled = path::sample_at(&pool, RENDEZVOUS_SAMPLE, path::Position::Middle, weights)?;
         let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
         let usable: Vec<&RouterStatus> = sampled
@@ -609,7 +617,7 @@ impl TorClient {
             .copied()
             .filter(|r| fetched.contains_key(&r.microdesc_digest))
             .collect();
-        let chosen = path::weighted_choice(&usable)?;
+        let chosen = path::weighted_choice_at(&usable, path::Position::Middle, weights)?;
         let md = fetched
             .get(&chosen.microdesc_digest)
             .ok_or_else(|| invalid_data("rendezvous point microdescriptor vanished"))?;
@@ -673,7 +681,12 @@ impl TorClient {
                 .into_iter()
                 .filter(|r| !taken.contains(&r.identity))
                 .collect();
-            path::weighted_choice(&candidates)?.identity
+            path::weighted_choice_at(
+                &candidates,
+                path::Position::Guard,
+                directory.consensus.bandwidth_weights(),
+            )?
+            .identity
         };
         let mut guards = self.guards.lock().unwrap();
         if !guards.entries.iter().any(|e| e.identity == chosen) {
@@ -1093,7 +1106,7 @@ impl HsdirRing {
 impl TorClient {
     /// The current descriptor for `address`, fetched from the directory nodes
     /// responsible for it if it is not already in hand.
-    pub fn descriptor(&self, address: &OnionAddress) -> io::Result<Arc<Descriptor>> {
+    pub fn descriptor(self: &Arc<Self>, address: &OnionAddress) -> io::Result<Arc<Descriptor>> {
         let ring = self.hsdir_ring()?;
         let blinded = ring.period.blinded_key(&address.public_key)?;
 
@@ -1183,7 +1196,7 @@ impl TorClient {
     /// The rendezvous circuit for this service, reusing the open one if there
     /// is one: every stream to a service shares a single circuit, as C Tor
     /// does.
-    fn onion_circuit(&self, address: &OnionAddress) -> io::Result<Circuit> {
+    fn onion_circuit(self: &Arc<Self>, address: &OnionAddress) -> io::Result<Circuit> {
         {
             let mut open = self.onion_circuits.lock().unwrap();
             open.retain(|_, c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
@@ -1248,14 +1261,14 @@ impl TorClient {
 
     /// The blinded key and subcredential for this address in the current time
     /// period. Both change when the period turns over.
-    fn onion_keys(&self, address: &OnionAddress) -> io::Result<([u8; 32], [u8; 32])> {
+    fn onion_keys(self: &Arc<Self>, address: &OnionAddress) -> io::Result<([u8; 32], [u8; 32])> {
         let ring = self.hsdir_ring()?;
         let blinded = ring.period.blinded_key(&address.public_key)?;
         Ok((blinded, address.subcredential(&blinded)))
     }
 
     fn fetch_descriptor(
-        &self,
+        self: &Arc<Self>,
         ring: &HsdirRing,
         blinded: &[u8; 32],
         subcredential: &[u8; 32],
@@ -1266,22 +1279,26 @@ impl TorClient {
 
         let mut last: Option<io::Error> = None;
         let mut all_absent = true;
-        for (attempt, identity) in responsible.iter().enumerate() {
-            // Three nodes is the usual budget. If all three simply had no
+        let mut asked = 0usize;
+        for group in responsible.chunks(HSDIR_PARALLEL) {
+            // Three nodes is the usual budget. If all of them simply had no
             // copy, the remaining ones are still worth asking: around a time
             // period boundary the service may not have finished uploading.
-            if attempt >= HSDIR_TRIES && !all_absent {
+            if asked >= HSDIR_TRIES && !all_absent {
                 break;
             }
-            match self.fetch_descriptor_from(identity, &path, blinded, subcredential) {
-                Ok(descriptor) => return Ok(descriptor),
-                // We have the descriptor and it says the service wants client
-                // authorization. Every other copy says the same thing.
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
-                Err(e) => {
-                    crate::debug!("hsdir {}: {e}", hex_encode(&identity[..4]));
-                    all_absent &= e.kind() == io::ErrorKind::NotFound;
-                    last = Some(e);
+            asked += group.len();
+            for (identity, result) in self.ask_hsdirs(group, &path, blinded, subcredential) {
+                match result {
+                    Ok(descriptor) => return Ok(descriptor),
+                    // We have the descriptor and it says the service wants
+                    // client authorization. Every other copy says the same.
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
+                    Err(e) => {
+                        crate::debug!("hsdir {}: {e}", hex_encode(&identity[..4]));
+                        all_absent &= e.kind() == io::ErrorKind::NotFound;
+                        last = Some(e);
+                    }
                 }
             }
         }
@@ -1295,6 +1312,64 @@ impl TorClient {
             Some(e) => e,
             None => invalid_data("no directory node is responsible for this onion service"),
         })
+    }
+
+    /// Ask several directory nodes at once, in completion order, stopping as
+    /// soon as one of them answers with a descriptor.
+    ///
+    /// The threads that lose the race are left to finish and close their own
+    /// circuits; a descriptor is a few kilobytes, so the wasted work is small
+    /// beside the round trips it saves.
+    fn ask_hsdirs(
+        self: &Arc<Self>,
+        group: &[[u8; 20]],
+        path: &str,
+        blinded: &[u8; 32],
+        subcredential: &[u8; 32],
+    ) -> Vec<([u8; 20], io::Result<Descriptor>)> {
+        if group.len() == 1 {
+            let identity = group[0];
+            let result = self.fetch_descriptor_from(&identity, path, blinded, subcredential);
+            return vec![(identity, result)];
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut running = 0usize;
+        for identity in group {
+            let client = Arc::clone(self);
+            let tx = tx.clone();
+            let (identity, path) = (*identity, path.to_string());
+            let (blinded, subcredential) = (*blinded, *subcredential);
+            let spawned = std::thread::Builder::new()
+                .name("hsdir-fetch".into())
+                .spawn(move || {
+                    let result =
+                        client.fetch_descriptor_from(&identity, &path, &blinded, &subcredential);
+                    let _ = tx.send((identity, result));
+                });
+            match spawned {
+                Ok(_) => running += 1,
+                Err(e) => crate::debug!("could not start a descriptor fetch: {e}"),
+            }
+        }
+        drop(tx);
+
+        let mut results = Vec::with_capacity(running);
+        for _ in 0..running {
+            match rx.recv() {
+                Ok((identity, result)) => {
+                    let succeeded = result.is_ok();
+                    results.push((identity, result));
+                    if succeeded {
+                        // Do not wait on the others; they will finish and tidy
+                        // up after themselves.
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        results
     }
 
     fn fetch_descriptor_from(
