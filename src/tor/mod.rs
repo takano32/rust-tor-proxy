@@ -1,9 +1,11 @@
 pub mod cell;
+pub mod client;
 pub mod certs;
 pub mod channel;
 pub mod circuit;
 pub mod dir;
 pub mod ntor;
+pub mod path;
 
 use std::net::SocketAddrV4;
 
