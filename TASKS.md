@@ -1126,21 +1126,21 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
 
 ### M17. SOCKS の手軽さ: SOCKS4a、HTTP CONNECT、既定ポート
 
-- [ ] **先頭 1 バイトで振り分け(`socks5.rs`)**: `0x05` → SOCKS5(既存)、`0x04` → SOCKS4 / 4a、
+- [x] **先頭 1 バイトで振り分け(`socks5.rs`)**: `0x05` → SOCKS5(既存)、`0x04` → SOCKS4 / 4a、
       ASCII 大文字(`A`〜`Z`)→ HTTP。それ以外は切断。
-- [ ] **SOCKS4a**: `VN=4 | CD=1 | DSTPORT(2) | DSTIP(4) | USERID… NUL`、DSTIP が `0.0.0.x`
+- [x] **SOCKS4a**: `VN=4 | CD=1 | DSTPORT(2) | DSTIP(4) | USERID… NUL`、DSTIP が `0.0.0.x`
       (x ≠ 0)なら続けて `HOST… NUL`(4a)。応答 `VN=0 | CD=90(許可)/ 91(拒否) | DSTPORT(2) | DSTIP(4)`。
       `.onion` も同じ経路。proxychains の既定設定(`socks4 127.0.0.1 9050`)がそのまま通る。
-- [ ] **HTTP CONNECT**: `CONNECT host:port HTTP/1.x` の 1 行と空行までのヘッダを読み、
+- [x] **HTTP CONNECT**: `CONNECT host:port HTTP/1.x` の 1 行と空行までのヘッダを読み、
       `HTTP/1.1 200 Connection established\r\n\r\n` を返して以後トンネル。CONNECT 以外の
       メソッド(絶対 URI の GET など、`http_proxy` で平文 HTTP を通そうとした場合)は
       `HTTP/1.1 501` と「use socks5h://」の本文で断る。`https_proxy=http://127.0.0.1:9050`
       の curl が通る。
-- [ ] **SOCKS5 の method 0x02**: `0x00` が無く `0x02` だけを申し出るクライアントも受理し、
+- [x] **SOCKS5 の method 0x02**: `0x00` が無く `0x02` だけを申し出るクライアントも受理し、
       RFC 1929 の `01 ULEN UNAME PLEN PASSWD` を読み捨てて `01 00` を返す。資格情報は使わない。
-- [ ] **`SERVER_PORT` の既定を 9050 に**(`config.rs`)。未設定でも動く。
-- [ ] 楽観応答(M16)を 3 つの入口すべてに適用する。
-- [ ] 単体テスト: 振り分け、SOCKS4a の解析と応答、CONNECT の解析と 501、method 0x02 の読み捨て。
+- [x] **`SERVER_PORT` の既定を 9050 に**(`config.rs`)。未設定でも動く。
+- [x] 楽観応答(M16)を 3 つの入口すべてに適用する。
+- [x] 単体テスト: 振り分け、SOCKS4a の解析と応答、CONNECT の解析と 501、method 0x02 の読み捨て。
 - 完了条件: `proxychains -q curl https://check.torproject.org/api/ip`(既定 conf)、
   `https_proxy=http://127.0.0.1:9050 curl …`、`curl --socks5-hostname …` の 3 つで `"IsTor":true`。
 

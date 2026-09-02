@@ -54,7 +54,10 @@ fn run() -> std::io::Result<()> {
 
     let client = Arc::new(tor::client::TorClient::bootstrap(config.state_dir)?);
     info!("ready: {}", client.consensus_summary());
-    info!("SOCKS5 listening on 0.0.0.0:{}", config.listen_port);
+    info!(
+        "listening on 0.0.0.0:{} for SOCKS5, SOCKS4a and HTTP CONNECT",
+        config.listen_port
+    );
 
     for incoming in listener.incoming() {
         match incoming {
