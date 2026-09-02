@@ -18,7 +18,12 @@ use super::client::TorClient;
 use crate::ffi::rand;
 
 /// How often the thread wakes to see whether anything is due.
-const TICK: Duration = Duration::from_secs(30);
+///
+/// Short enough that a circuit which has stopped carrying anything is found
+/// and replaced within about half a minute of a reader noticing, which is what
+/// makes a hung connection recoverable rather than something the application
+/// has to time out for itself.
+const TICK: Duration = Duration::from_secs(10);
 
 /// First delay after a failed consensus fetch; it doubles up to the cap.
 const RETRY_MIN: u64 = 300;
@@ -66,6 +71,12 @@ fn run(client: Weak<TorClient>) {
         };
 
         client.retry_primary_guard();
+        // A circuit whose reader has been waiting is tested here rather than
+        // on the request's own thread, so a probe never delays traffic.
+        client.probe_quiet_circuits();
+        // Circuits thrown out for being unusable are counted against the guard
+        // they were built on here, off the path of any request.
+        client.note_bad_circuits();
 
         if now_unix() < next_refresh {
             continue;

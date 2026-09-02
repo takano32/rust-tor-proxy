@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddrV4;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -362,6 +362,115 @@ struct Inner {
     event: Condvar,
     streams: Mutex<HashMap<u16, Arc<StreamShared>>>,
     closed: AtomicBool,
+    /// How this circuit has actually performed, as plain atomics.
+    ///
+    /// Deliberately not part of `State`: the pool reads these while holding
+    /// its own lock, and taking a circuit's state lock from there would make
+    /// an edge against the ordering `send_order` documents above.
+    meter: Meter,
+}
+
+/// What a circuit has carried, so the pool can tell a working path from a
+/// hopeless one.
+///
+/// Nothing here predicts anything: measured on the live network, neither a
+/// circuit's round trip nor its exit's consensus bandwidth correlates with the
+/// throughput it goes on to deliver (Pearson +0.07 and +0.15 over sixteen
+/// samples). What does show up is that a bad path is *persistently* bad --
+/// tens of KB/s where a working one does hundreds -- so the only honest
+/// measure is what the circuit has already delivered.
+struct Meter {
+    /// Application bytes received.
+    rx_bytes: AtomicU64,
+    /// Milliseconds spent actually receiving, which is not the same as the
+    /// time the circuit has existed.
+    ///
+    /// Only the gap between two data cells less than [`ACTIVE_GAP_MS`] apart
+    /// is counted. A circuit reused across a browsing session is idle for most
+    /// of its life, and dividing its bytes by its lifetime would call every
+    /// such circuit hopeless -- the measurement has to be of the transfer, not
+    /// of the wall clock.
+    active_ms: AtomicU64,
+    /// Milliseconds since the circuit was created, at the most recent
+    /// RELAY_DATA. Zero means none yet.
+    last_data_ms: AtomicU64,
+    /// A reader has been waiting a long time with nothing arriving.
+    ///
+    /// This is a request for a liveness probe, not a verdict. Waiting proves
+    /// nothing on its own: an idle SSH session and a black-holed circuit look
+    /// identical from here, and this proxy always has a reader parked in
+    /// `io::copy` for every connection it carries. Only asking the far end a
+    /// question it must answer tells the two apart.
+    wants_probe: AtomicBool,
+    created: Instant,
+}
+
+/// How long a reader waits with nothing arriving before the circuit under it
+/// is worth testing.
+pub const QUIET_BEFORE_PROBE: Duration = Duration::from_secs(15);
+
+/// How long the probe itself waits for an answer.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Two data cells further apart than this did not belong to one transfer, so
+/// the gap between them is not time spent receiving. Generous next to a round
+/// trip of a few hundred milliseconds, and far below any human pause.
+const ACTIVE_GAP_MS: u64 = 500;
+
+impl Meter {
+    fn new() -> Self {
+        Self {
+            rx_bytes: AtomicU64::new(0),
+            active_ms: AtomicU64::new(0),
+            last_data_ms: AtomicU64::new(0),
+            wants_probe: AtomicBool::new(false),
+            created: Instant::now(),
+        }
+    }
+
+    fn note_data(&self, len: usize) {
+        // `max(1)` so that the very first cell does not store a zero, which is
+        // the "nothing yet" marker.
+        let now = (self.created.elapsed().as_millis() as u64).max(1);
+        self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        // Anything arriving answers the question a probe would have asked.
+        self.wants_probe.store(false, Ordering::Relaxed);
+        let previous = self.last_data_ms.swap(now, Ordering::Relaxed);
+        // The first cell has no gap to measure, and a long gap is a pause
+        // between transfers rather than slow going during one.
+        let gap = now.saturating_sub(previous);
+        if previous != 0 && gap <= ACTIVE_GAP_MS {
+            self.active_ms.fetch_add(gap, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a circuit has delivered, and over how much time actually spent
+/// receiving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub bytes: u64,
+    /// Milliseconds spent receiving, excluding the pauses between transfers.
+    pub active_ms: u64,
+}
+
+impl Delivery {
+    /// Delivered kilobytes per second over the time actually spent receiving,
+    /// or `None` when too little has been carried to say anything.
+    ///
+    /// The floor matters: below a megabyte or so the figure is the congestion
+    /// window opening rather than the path's capacity. Measured here, a second
+    /// transfer on an already-warm circuit runs 1.7x the first, so a cheap
+    /// floor would condemn every circuit for being new.
+    pub fn kbps(&self, min_bytes: u64, min_active_ms: u64) -> Option<u64> {
+        // A byte per millisecond is a kilobyte per second, so the division is
+        // the whole conversion. Guarded against a zero denominator on its own
+        // account rather than relying on the caller's minimum.
+        if self.active_ms == 0 || self.bytes < min_bytes || self.active_ms < min_active_ms {
+            return None;
+        }
+        Some(self.bytes / self.active_ms)
+    }
 }
 
 pub struct Circuit {
@@ -406,6 +515,7 @@ impl Circuit {
             event: Condvar::new(),
             streams: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            meter: Meter::new(),
         });
 
         let pump_inner = Arc::clone(&inner);
@@ -706,6 +816,67 @@ impl Circuit {
         self.inner.streams.lock().unwrap().len()
     }
 
+    /// Whether a reader on this circuit has waited long enough that the
+    /// circuit is worth testing. See `Meter::wants_probe`.
+    pub fn wants_probe(&self) -> bool {
+        self.inner.meter.wants_probe.load(Ordering::Relaxed)
+    }
+
+    /// Ask the last hop a question it has to answer, to find out whether this
+    /// circuit still carries anything.
+    ///
+    /// Opens a directory stream to the relay at the far end and waits for it
+    /// to say anything at all -- a refusal counts, since the point is that the
+    /// circuit still reaches something that talks back. A circuit that has
+    /// been quietly dropping cells answers nothing, and that is the case this
+    /// exists to catch: it is invisible at the channel level, because the
+    /// channel to the guard is fine.
+    pub fn probe(&self, timeout: Duration) -> io::Result<()> {
+        let stream = self.begin_dir_stream()?;
+        let deadline = Instant::now() + timeout;
+        let shared = Arc::clone(&stream.live().shared);
+        let mut buf = shared.buf.lock().unwrap();
+        let answered = loop {
+            if buf.connected || buf.ended.is_some() {
+                break true;
+            }
+            if buf.error.is_some() || self.is_closed() {
+                break false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            let (guard, _) = shared
+                .cond
+                .wait_timeout(buf, (deadline - now).min(Duration::from_millis(500)))
+                .unwrap();
+            buf = guard;
+        };
+        drop(buf);
+        stream.close();
+        if answered {
+            // Whatever else is quiet, the circuit itself works.
+            self.inner.meter.wants_probe.store(false, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the circuit did not answer a directory request",
+            ))
+        }
+    }
+
+    /// What this circuit has actually carried. Lock-free, so the pool may ask
+    /// while holding its own lock.
+    pub fn delivery(&self) -> Delivery {
+        let meter = &self.inner.meter;
+        Delivery {
+            bytes: meter.rx_bytes.load(Ordering::Relaxed),
+            active_ms: meter.active_ms.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire) || self.inner.chan.is_closed()
     }
@@ -747,7 +918,11 @@ impl Circuit {
     /// Open a stream and wait for the exit to confirm it.
     pub fn begin_stream(&self, target: &str, port: u16) -> io::Result<TorStream> {
         let addrport = format!("{}:{}\0", target.to_lowercase(), port);
-        self.open_stream(RELAY_BEGIN, addrport.as_bytes())
+        self.open_stream(
+            RELAY_BEGIN,
+            addrport.as_bytes(),
+            &format!("{target}:{port}"),
+        )
     }
 
     /// Open a stream on a rendezvous circuit.
@@ -756,17 +931,21 @@ impl Circuit {
     /// of this circuit, so there is nothing to name, and C Tor sends `:port`
     /// alone here too.
     pub fn begin_stream_onion(&self, port: u16) -> io::Result<TorStream> {
-        self.open_stream(RELAY_BEGIN, format!(":{port}\0").as_bytes())
+        self.open_stream(
+            RELAY_BEGIN,
+            format!(":{port}\0").as_bytes(),
+            "the onion service",
+        )
     }
 
     /// Open a stream to the relay's own directory cache.
     pub fn begin_dir_stream(&self) -> io::Result<TorStream> {
-        self.open_stream(RELAY_BEGIN_DIR, &[])
+        self.open_stream(RELAY_BEGIN_DIR, &[], "the directory cache")
     }
 
     /// Send a BEGIN and hand back the stream at once, without waiting for the
     /// far end to confirm it. See [`TorStream`] for why.
-    fn open_stream(&self, relay_command: u8, payload: &[u8]) -> io::Result<TorStream> {
+    fn open_stream(&self, relay_command: u8, payload: &[u8], what: &str) -> io::Result<TorStream> {
         let hop = self.last_hop()?;
         let stream_id = self.alloc_stream_id()?;
         // The circuit's flow control is settled before any stream is opened,
@@ -800,7 +979,7 @@ impl Circuit {
             return Err(e);
         }
         debug!(
-            "circuit {}: stream {stream_id} opened, {} on the circuit",
+            "circuit {}: stream {stream_id} to {what}, {} on the circuit",
             self.inner.circ_id,
             self.open_streams()
         );
@@ -1171,6 +1350,7 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
                     buf.deliver_window -= 1;
                     buf.unacked += 1;
                     buf.data.extend(payload.iter().copied());
+                    inner.meter.note_data(payload.len());
                     // With congestion control the circuit acknowledges cells
                     // as soon as they are decrypted, so nothing but XOFF stops
                     // a slow reader from being buried (proposal 324 4.1.1).
@@ -1580,6 +1760,7 @@ impl TorStream {
 /// Wait for the far end to say something on this stream: data, a refusal, or
 /// the circuit failing under it.
 fn read_stream(live: &Live, out: &mut [u8]) -> io::Result<usize> {
+    let waiting_since = Instant::now();
     let mut buf = live.shared.buf.lock().unwrap();
     loop {
         if !buf.data.is_empty() {
@@ -1607,6 +1788,15 @@ fn read_stream(live: &Live, out: &mut [u8]) -> io::Result<usize> {
         buf = guard;
         if live.circuit.is_closed() && buf.data.is_empty() {
             return Err(circuit_closed());
+        }
+        // Long enough to be worth asking whether the circuit is still there.
+        // This is not a verdict -- see `Meter::wants_probe`.
+        if waiting_since.elapsed() >= QUIET_BEFORE_PROBE {
+            live.circuit
+                .inner
+                .meter
+                .wants_probe
+                .store(true, Ordering::Relaxed);
         }
     }
 }
@@ -1711,6 +1901,53 @@ impl io::Write for TorStream {
 mod tests {
     use super::*;
     use crate::ffi::hash::Digest;
+
+    /// The meter counts time spent receiving, not time elapsed: a pause
+    /// between transfers must not be charged to the circuit.
+    #[test]
+    fn the_meter_counts_transfer_time_and_not_the_pauses() {
+        let meter = Meter::new();
+        // Three cells in quick succession: two gaps, both counted.
+        meter.note_data(500);
+        std::thread::sleep(Duration::from_millis(20));
+        meter.note_data(500);
+        std::thread::sleep(Duration::from_millis(20));
+        meter.note_data(500);
+        let busy = meter.active_ms.load(Ordering::Relaxed);
+        assert!(
+            (20..200).contains(&busy),
+            "two short gaps should be ~40ms, got {busy}"
+        );
+        assert_eq!(meter.rx_bytes.load(Ordering::Relaxed), 1500);
+
+        // A pause longer than ACTIVE_GAP_MS is between transfers, not during
+        // one, so it is not added.
+        std::thread::sleep(Duration::from_millis(ACTIVE_GAP_MS + 100));
+        meter.note_data(500);
+        let after = meter.active_ms.load(Ordering::Relaxed);
+        assert_eq!(after, busy, "an idle pause must not count as transfer time");
+        assert_eq!(meter.rx_bytes.load(Ordering::Relaxed), 2000);
+    }
+
+    /// A byte per millisecond is a kilobyte per second, and nothing is
+    /// reported until enough has been carried to mean something.
+    #[test]
+    fn delivered_rate_needs_enough_evidence() {
+        let d = Delivery {
+            bytes: 8 << 20,
+            active_ms: 8_000,
+        };
+        assert_eq!(d.kbps(1 << 20, 2_000), Some(1048));
+        // Too few bytes, or too little time, and there is no answer to give.
+        assert_eq!(d.kbps(64 << 20, 2_000), None);
+        assert_eq!(d.kbps(1 << 20, 60_000), None);
+        // A circuit that has carried nothing must not divide by zero.
+        let empty = Delivery {
+            bytes: 0,
+            active_ms: 0,
+        };
+        assert_eq!(empty.kbps(0, 0), None);
+    }
     use crate::tor::ntor::CircuitKeys;
 
     fn keys(seed: u8) -> CircuitKeys {

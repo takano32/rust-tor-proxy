@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,30 @@ const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 /// off. Two, because one of them may simply be down.
 const REACHABILITY_PROBES: usize = 2;
 
+/// How many of a guard's circuits must be thrown out as unusable before the
+/// guard itself is held responsible and the client moves to the next one.
+///
+/// More than one, because a single bad circuit is far more likely to be a bad
+/// middle or exit: measured here, circuits on one guard varied from 194 to
+/// 667 KB/s. A guard that is genuinely the problem produces bad circuit after
+/// bad circuit -- one measured guard delivered 402/203/667/194 KB/s where
+/// another on the same client did 771/1367/1123/1032.
+const GUARD_STRIKES: usize = 3;
+
+/// How long a strike counts for. Long enough to accumulate three, short enough
+/// that a guard is not condemned for a bad afternoon a week ago.
+const GUARD_STRIKE_WINDOW: Duration = Duration::from_secs(1800);
+
+/// The most guards this client will abandon for slowness in one run.
+///
+/// This is the safety valve on an otherwise adversary-driven loop: anything on
+/// the path can make a circuit slow, passively and deniably, and a client that
+/// responds by moving on will keep moving until it lands somewhere the
+/// adversary likes (proposal 344, adversary-induced circuit creation). A hard
+/// cap bounds how far that can be driven. Failing to *connect* is a separate
+/// matter and is not capped -- an unreachable guard is not a judgement call.
+const MAX_SLOW_GUARD_CHANGES: usize = 2;
+
 pub struct TorClient {
     /// Swapped wholesale when the maintenance thread verifies a newer
     /// consensus. Readers take a clone of the `Arc` and let go of the lock at
@@ -92,6 +116,9 @@ pub struct TorClient {
     /// Held while the ring is being built, so that two `.onion` requests
     /// arriving together do not both pay for it.
     hsdir_build: Mutex<()>,
+    /// How many guards have been abandoned for being slow rather than
+    /// unreachable, which is capped: see `MAX_SLOW_GUARD_CHANGES`.
+    slow_guard_changes: AtomicUsize,
     /// Set once a `.onion` request has needed the ring. Only then is it worth
     /// the maintenance thread rebuilding it after a consensus change; a client
     /// that never touches onion services should never pay for one.
@@ -137,6 +164,16 @@ struct Guards {
 
 struct GuardEntry {
     identity: [u8; 20],
+    /// When circuits on this guard were last thrown out as unusable.
+    strikes: Vec<Instant>,
+    /// When this guard was moved off for producing bad circuits.
+    ///
+    /// Separate from `failed_at`, which means "would not talk to us" and is
+    /// retried after ten minutes. A guard demoted for being useless must not
+    /// be reinstated on that timer -- it answers perfectly well, so the retry
+    /// would always succeed and put the client straight back on it with the
+    /// change already counted against its cap.
+    demoted_at: Option<Instant>,
     /// Where it was last reached, remembered across restarts so that the very
     /// first thing a new process does can be to reconnect to its guard --
     /// before it has a consensus to look the address up in.
@@ -162,6 +199,13 @@ struct OpenGuard {
 }
 
 impl GuardEntry {
+    /// Whether this guard is still serving out a demotion for producing
+    /// unusable circuits.
+    fn is_demoted(&self) -> bool {
+        self.demoted_at
+            .is_some_and(|at| at.elapsed() < GUARD_STRIKE_WINDOW)
+    }
+
     /// Open a channel from the remembered address alone.
     fn reconnect(&self) -> Option<OpenGuard> {
         let contact = self.contact?;
@@ -183,19 +227,41 @@ impl Guards {
     /// The first entry worth trying: unfailed ones in order, then any whose
     /// cool-off has elapsed.
     fn next_candidate(&self) -> Option<[u8; 20]> {
-        if let Some(entry) = self.entries.iter().find(|e| e.failed_at.is_none()) {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.failed_at.is_none() && !e.is_demoted())
+        {
             return Some(entry.identity);
         }
         self.entries
             .iter()
             .find(|e| {
-                e.failed_at
-                    .is_some_and(|at| at.elapsed() >= GUARD_RETRY_INTERVAL)
+                !e.is_demoted()
+                    && e.failed_at
+                        .is_some_and(|at| at.elapsed() >= GUARD_RETRY_INTERVAL)
             })
             .map(|e| e.identity)
     }
 
+    /// Stop choosing this guard, and drop the channel to it.
+    ///
+    /// Used when the guard will not talk to us: the channel is no use to
+    /// anyone, so it is closed.
     fn mark_failed(&mut self, identity: &[u8; 20]) {
+        self.stop_using(identity);
+        if let Some(open) = self.open.take_if(|open| &open.identity == identity) {
+            open.channel.close();
+        }
+    }
+
+    /// Stop choosing this guard for new circuits, but leave the channel open.
+    ///
+    /// Used when the guard answers but its circuits keep measuring badly.
+    /// Closing the channel would tear down every circuit on it, which is every
+    /// circuit this client has -- including the streams a user is in the
+    /// middle of, which is precisely what the change was meant to protect.
+    fn stop_using(&mut self, identity: &[u8; 20]) {
         if let Some(entry) = self.entries.iter_mut().find(|e| &e.identity == identity) {
             entry.failed_at = Some(Instant::now());
         }
@@ -204,9 +270,9 @@ impl Guards {
             .as_ref()
             .is_some_and(|open| &open.identity == identity)
         {
-            if let Some(open) = self.open.take() {
-                open.channel.close();
-            }
+            // Forget it as the default without closing it: circuits already
+            // built on it keep working and finish their streams.
+            self.open = None;
         }
     }
 
@@ -261,6 +327,7 @@ impl TorClient {
             hsdir_ring: Mutex::new(None),
             hsdir_build: Mutex::new(()),
             hsdir_wanted: AtomicBool::new(false),
+            slow_guard_changes: AtomicUsize::new(0),
             descriptors: Mutex::new(HashMap::new()),
             onion_circuits: Mutex::new(HashMap::new()),
         });
@@ -393,10 +460,10 @@ impl TorClient {
         if let Some(circuit) = self.pool.circuit_for(port) {
             return Ok(circuit);
         }
-        let (circuit, exit) = self.build_exit_circuit(&[port])?;
+        let (circuit, exit, guard) = self.build_exit_circuit(&[port])?;
         // Built to serve a request that is waiting, so it counts as dirty from
         // this moment rather than from its first stream.
-        self.pool.insert(circuit.clone(), exit, true);
+        self.pool.insert(circuit.clone(), exit, guard, true);
         Ok(circuit)
     }
 
@@ -418,17 +485,20 @@ impl TorClient {
             return Err(e);
         }
         self.constrain(&mut constraints, &middle);
-        Ok(Stub::new(circuit, constraints))
+        Ok(Stub::new(circuit, constraints, guard.rsa_identity))
     }
 
     /// A three-hop circuit whose exit allows `ports`, extending a waiting stub
     /// if there is one.
-    pub fn build_exit_circuit(&self, ports: &[u16]) -> io::Result<(Circuit, Arc<Microdesc>)> {
+    pub fn build_exit_circuit(
+        &self,
+        ports: &[u16],
+    ) -> io::Result<(Circuit, Arc<Microdesc>, [u8; 20])> {
         // Any stub will do: the exit has not been chosen yet, so it can be
         // chosen to fit whichever stub we get.
         if let Some(stub) = self.pool.take_stub(&|_| true) {
             match self.extend_to_exit(&stub, ports) {
-                Ok(exit) => return Ok((stub.circuit, exit)),
+                Ok(exit) => return Ok((stub.circuit, exit, stub.guard)),
                 Err(e) => {
                     crate::debug!("stub could not be extended to an exit: {e}");
                     stub.circuit.close();
@@ -437,6 +507,7 @@ impl TorClient {
         }
 
         let (channel, guard) = self.guard_channel()?;
+        let guard_identity = guard.rsa_identity;
         let mut constraints = PathConstraints::default();
         self.constrain(&mut constraints, &guard);
         let middle = self.choose_middle(&constraints)?;
@@ -444,11 +515,11 @@ impl TorClient {
         let built = (|| {
             circuit.extend(&middle)?;
             self.constrain(&mut constraints, &middle);
-            let stub = Stub::new(circuit.clone(), constraints);
+            let stub = Stub::new(circuit.clone(), constraints, guard_identity);
             self.extend_to_exit(&stub, ports)
         })();
         match built {
-            Ok(exit) => Ok((circuit, exit)),
+            Ok(exit) => Ok((circuit, exit, guard_identity)),
             Err(e) => {
                 circuit.close();
                 Err(e)
@@ -699,6 +770,8 @@ impl TorClient {
             guards.entries.push(GuardEntry {
                 identity: chosen,
                 contact: None,
+                strikes: Vec::new(),
+                demoted_at: None,
                 failed_at: None,
             });
         }
@@ -750,6 +823,120 @@ impl TorClient {
         }
     }
 
+    /// Test any circuit whose reader has been waiting a long time, and throw
+    /// out the ones that turn out to be carrying nothing.
+    ///
+    /// This is the "connectivity has gone really bad" case. It cannot be
+    /// decided by waiting alone -- an idle connection and a black-holed
+    /// circuit are indistinguishable from the client -- so the circuit is
+    /// asked a question the far end has to answer. A circuit that answers is
+    /// left alone however quiet it is, which is what keeps an idle SSH
+    /// session or a long-polling request alive.
+    pub fn probe_quiet_circuits(&self) {
+        for (circuit, guard) in self.pool.wanting_probe() {
+            match circuit.probe(circuit::PROBE_TIMEOUT) {
+                Ok(()) => crate::debug!(
+                    "circuit {} is quiet but alive; leaving it",
+                    circuit.circ_id()
+                ),
+                Err(e) => {
+                    crate::info!(
+                        "circuit {} answers nothing ({e}); dropping it and everything on it",
+                        circuit.circ_id()
+                    );
+                    let _ = guard;
+                    self.pool.condemn(&circuit);
+                }
+            }
+        }
+    }
+
+    /// Count a circuit that had to be thrown away against the guard it was
+    /// built on, and move off that guard once it has collected enough strikes.
+    ///
+    /// The user asked for a proxy that switches away from a path that is
+    /// hopeless rather than one that hunts for the quickest, and this is the
+    /// guard half of that. It is the part with a real anonymity cost -- the
+    /// guard is on every circuit, and anything between here and it can make
+    /// circuits slow on purpose -- so it is bounded three ways: three strikes
+    /// rather than one, a window they expire from, and a hard cap on how many
+    /// guards may be abandoned this way at all.
+    pub fn note_bad_circuits(&self) {
+        let blamed = self.pool.take_blame();
+        if blamed.is_empty() {
+            return;
+        }
+        // At most one strike per guard per sweep. Every circuit in the pool
+        // runs over the same guard, so a single bad minute produces a batch of
+        // blame all at once -- counting each entry would let one incident
+        // supply the whole three-strike budget and defeat the point of
+        // requiring a run of failures.
+        let mut distinct: Vec<[u8; 20]> = Vec::new();
+        for (identity, verdict) in blamed {
+            if !distinct.contains(&identity) {
+                crate::debug!(
+                    "a circuit on guard {} was {verdict:?}",
+                    hex_encode(&identity[..8])
+                );
+                distinct.push(identity);
+            }
+        }
+
+        let mut guards = self.guards.lock().unwrap();
+        let mut give_up_on: Option<[u8; 20]> = None;
+        for identity in distinct {
+            let Some(entry) = guards.entries.iter_mut().find(|e| e.identity == identity) else {
+                continue;
+            };
+            let enough = strike(&mut entry.strikes, Instant::now());
+            crate::debug!(
+                "guard {} has {} bad sweeps in the last half hour",
+                hex_encode(&identity[..8]),
+                entry.strikes.len()
+            );
+            if enough {
+                give_up_on = Some(identity);
+            }
+        }
+
+        let Some(identity) = give_up_on else {
+            return;
+        };
+        if self.slow_guard_changes.load(Ordering::Relaxed) >= MAX_SLOW_GUARD_CHANGES {
+            crate::debug!(
+                "guard {} keeps producing bad circuits, but the limit on changing \
+                 guards for slowness has been reached; keeping it",
+                hex_encode(&identity[..8])
+            );
+            return;
+        }
+        self.slow_guard_changes.fetch_add(1, Ordering::Relaxed);
+        crate::info!(
+            "guard {} has produced {GUARD_STRIKES} unusable circuits; moving to another",
+            hex_encode(&identity[..8])
+        );
+        if let Some(entry) = guards.entries.iter_mut().find(|e| e.identity == identity) {
+            entry.strikes.clear();
+            entry.demoted_at = Some(Instant::now());
+        }
+        // Note: not `mark_failed`. That closes the channel, and every circuit
+        // this client has runs over it -- including the ones carrying the
+        // user's traffic right now. The guard is simply no longer chosen; its
+        // existing circuits finish their work.
+        guards.stop_using(&identity);
+        // Send it to the back rather than dropping it: it is still a guard we
+        // have used, and the point is to stop preferring it, not to forget it.
+        if let Some(index) = guards.entries.iter().position(|e| e.identity == identity) {
+            let entry = guards.entries.remove(index);
+            guards.entries.push(entry);
+        }
+        self.save_guards(&guards);
+        drop(guards);
+        // Stubs and unused circuits on the old guard are no longer wanted;
+        // `clear` keeps the ones carrying streams.
+        self.pool.clear();
+    }
+
     /// Try the primary guard again after it failed. Called by the maintenance
     /// thread, so that a moment's network trouble does not move us off it for
     /// good.
@@ -759,6 +946,12 @@ impl TorClient {
             let Some(entry) = guards.entries.first() else {
                 return;
             };
+            // A guard moved off for being useless answers connections
+            // perfectly well, so retrying it would always succeed and undo
+            // the demotion within ten minutes.
+            if entry.is_demoted() {
+                return;
+            }
             // Nothing to do when the primary is the one already in use.
             if entry.failed_at.is_none()
                 && guards
@@ -1505,6 +1698,8 @@ fn load_guards(state_dir: &Path) -> Vec<GuardEntry> {
         entries.push(GuardEntry {
             identity,
             contact,
+            strikes: Vec::new(),
+            demoted_at: None,
             failed_at: None,
         });
         if entries.len() == MAX_GUARDS {
@@ -1527,6 +1722,19 @@ fn serialize_guards(entries: &[GuardEntry]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Record one bad circuit against a guard and say whether it has now
+/// collected enough of them to be moved off.
+///
+/// Split out so the counting can be tested without a network: strikes older
+/// than the window are forgotten before the new one is added, so a guard is
+/// judged on a recent run of failures rather than on a total accumulated over
+/// a long session.
+fn strike(strikes: &mut Vec<Instant>, now: Instant) -> bool {
+    strikes.retain(|at| now.duration_since(*at) < GUARD_STRIKE_WINDOW);
+    strikes.push(now);
+    strikes.len() >= GUARD_STRIKES
 }
 
 /// Is anything on the Tor network reachable from here at all?
@@ -1560,9 +1768,180 @@ fn relay_info(status: &RouterStatus, md: &Microdesc) -> RelayInfo {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guard is moved off after a run of bad circuits, not after a total.
+    #[test]
+    fn strikes_accumulate_within_a_window_and_expire_outside_it() {
+        let now = Instant::now();
+        let mut strikes = Vec::new();
+        for i in 1..GUARD_STRIKES {
+            assert!(
+                !strike(&mut strikes, now),
+                "{i} strike(s) must not be enough"
+            );
+        }
+        assert!(strike(&mut strikes, now), "the last strike tips it over");
+
+        // Spread the same number of failures over a long session and the guard
+        // is never condemned: each one is forgotten before the next arrives.
+        let mut sparse = Vec::new();
+        let step = GUARD_STRIKE_WINDOW + Duration::from_secs(1);
+        for i in 0..GUARD_STRIKES * 3 {
+            let at = now + step * (i as u32);
+            assert!(
+                !strike(&mut sparse, at),
+                "failures {} apart must not add up",
+                step.as_secs()
+            );
+            assert_eq!(sparse.len(), 1, "only the newest survives the window");
+        }
+    }
+
+    // An adversary who can only make circuits slow must not be able to walk
+    // this client off every guard it has, and one bad circuit is far more
+    // often a bad exit than a bad guard. Both are properties of the constants
+    // rather than of any code path, so they are checked at compile time.
+    const _: () = assert!(MAX_SLOW_GUARD_CHANGES < MAX_GUARDS);
+    const _: () = assert!(GUARD_STRIKES > 1);
+    // A demotion has to outlast the retry timer, or the guard comes straight
+    // back as primary with the change already counted against the cap.
+    const _: () = assert!(GUARD_STRIKE_WINDOW.as_secs() > GUARD_RETRY_INTERVAL.as_secs());
+
+    fn entry(identity: u8) -> GuardEntry {
+        GuardEntry {
+            identity: [identity; 20],
+            contact: None,
+            strikes: Vec::new(),
+            demoted_at: None,
+            failed_at: None,
+        }
+    }
+
+    /// A demoted guard stops being chosen, and stays that way for longer than
+    /// the "it failed to connect" retry would wait.
+    #[test]
+    fn a_demoted_guard_is_not_chosen_again_straight_away() {
+        let mut guards = Guards {
+            entries: vec![entry(1), entry(2)],
+            open: None,
+        };
+        assert_eq!(guards.next_candidate(), Some([1u8; 20]));
+
+        // Demoting the first hands the choice to the second.
+        guards.stop_using(&[1u8; 20]);
+        guards.entries[0].demoted_at = Some(Instant::now());
+        assert_eq!(guards.next_candidate(), Some([2u8; 20]));
+
+        // And it stays demoted even once the connection-failure cool-off has
+        // passed, which is the whole point: it answers fine, it is just no
+        // good, so the ordinary retry would put us straight back on it.
+        guards.entries[0].failed_at = Some(Instant::now() - GUARD_RETRY_INTERVAL);
+        assert_eq!(guards.next_candidate(), Some([2u8; 20]));
+
+        // A demotion older than the window is forgotten: with nothing else to
+        // fall back to, the guard is eligible again rather than the client
+        // being left with none.
+        guards.entries[0].demoted_at = Some(Instant::now() - GUARD_STRIKE_WINDOW);
+        guards.entries.truncate(1);
+        assert_eq!(guards.next_candidate(), Some([1u8; 20]));
+
+        // While it is still demoted, though, having nothing else does not
+        // bring it back -- `ensure_guard` adds a fresh guard instead.
+        guards.entries[0].demoted_at = Some(Instant::now());
+        assert_eq!(guards.next_candidate(), None);
+    }
+
+    /// Demoting a guard must not close the channel: every circuit this client
+    /// has runs over it, including the ones carrying traffic right now.
+    #[test]
+    fn stopping_use_of_a_guard_leaves_its_entry_in_the_list() {
+        let mut guards = Guards {
+            entries: vec![entry(1), entry(2)],
+            open: None,
+        };
+        guards.stop_using(&[1u8; 20]);
+        assert_eq!(
+            guards.entries.len(),
+            2,
+            "the guard is demoted, not forgotten"
+        );
+        assert!(guards.entries[0].failed_at.is_some());
+        // Marking it working again clears the failure but not a demotion.
+        guards.mark_working(&[1u8; 20]);
+        assert!(guards.entries[0].failed_at.is_none());
+    }
+}
+
+#[cfg(test)]
 mod live_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Live check: the liveness probe must not condemn healthy circuits.
+    ///
+    /// The probe asks the last hop for a directory document. Not every exit
+    /// runs a directory cache, and one that refuses must still count as an
+    /// answer -- the question is whether the circuit carries anything, not
+    /// whether the relay is helpful. A false positive here closes a working
+    /// circuit and every stream on it, so the rate has to be zero.
+    ///
+    /// Run with `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires network access to the Tor network"]
+    fn the_liveness_probe_does_not_condemn_healthy_circuits() {
+        crate::log::init();
+        let dir = std::env::temp_dir().join(format!("tor-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let client = TorClient::bootstrap(dir.clone()).expect("bootstrap");
+
+        let mut answered = 0;
+        let mut refused = 0;
+        for attempt in 0..8 {
+            let (circuit, _exit, _guard) = match client.build_exit_circuit(&[443]) {
+                Ok(built) => built,
+                Err(e) => {
+                    println!("attempt {attempt}: could not build a circuit: {e}");
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            match circuit.probe(circuit::PROBE_TIMEOUT) {
+                Ok(()) => {
+                    answered += 1;
+                    println!(
+                        "circuit {} answered in {:.2}s",
+                        circuit.circ_id(),
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+                Err(e) => {
+                    refused += 1;
+                    println!(
+                        "circuit {} did NOT answer after {:.2}s: {e}",
+                        circuit.circ_id(),
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            circuit.close();
+        }
+
+        println!("{answered} answered, {refused} did not");
+        assert!(answered + refused > 0, "no circuit could be built at all");
+        // A freshly built circuit works by definition -- it just completed a
+        // handshake with all three hops. Anything that fails the probe here is
+        // the probe being wrong.
+        assert_eq!(
+            refused,
+            0,
+            "the probe condemned {refused} of {} working circuits",
+            answered + refused
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Live check: bootstrap, pin a guard, build a three-hop circuit and pull
     /// a page through it.

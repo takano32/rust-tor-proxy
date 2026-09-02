@@ -183,6 +183,30 @@ rendezvous circuit.
 
 Anonymity is weaker than the real Tor client. Specifically:
 
+- **Circuits that measure badly are thrown away, and a guard whose circuits
+  keep measuring badly is abandoned.** This is a deliberate trade of anonymity
+  for speed, made at the user's request. It is bounded: the test is an
+  absolute floor (150 KB/s once a circuit has carried a megabyte over two
+  seconds of actual transfer), never a ranking, so
+  a relay gains nothing by being marginally quicker than its neighbours —
+  only by not being unusable. A guard needs three bad circuits in half an hour
+  to be moved off, and no more than two guards are given up this way per run,
+  because anything on the path can make a circuit slow on purpose and a client
+  that responds by moving on can otherwise be walked wherever an adversary
+  likes (proposal 344, adversary-induced circuit creation). Failing to
+  *connect* is a separate matter and is not capped.
+- A circuit whose reader has been waiting a while is *asked* whether it still
+  works — a directory request to its last hop, which any answer at all
+  satisfies — rather than assumed dead. Waiting proves nothing on its own: a
+  proxy always has a reader parked on every connection it carries, so an idle
+  SSH session and a black-holed circuit look identical until one of them is
+  made to answer. Only a circuit that answers nothing is closed.
+- Among circuits that have not been thrown away, one is chosen at **random**
+  rather than the fastest. Measured here, neither a circuit's round-trip time
+  nor its exit's consensus bandwidth predicts the throughput it goes on to
+  deliver (Pearson +0.07 and +0.15 over sixteen samples), so a ranking would
+  be noise — and it would hand an adversary a gradient to climb, which a floor
+  does not.
 - Concurrent streams are spread across up to four circuits, because each
   circuit has its own flow-control window and striping is what makes parallel
   transfers add up. The price is that four exits see this client's traffic at
