@@ -21,6 +21,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use super::cc;
 use super::cell::{self, Cell, CELL_BODY_LEN};
 use super::channel::Channel;
 use super::hs::ntor::HsCircuitKeys;
@@ -47,6 +48,11 @@ pub const RELAY_INTRODUCE1: u8 = 34;
 pub const RELAY_RENDEZVOUS2: u8 = 37;
 pub const RELAY_RENDEZVOUS_ESTABLISHED: u8 = 39;
 pub const RELAY_INTRODUCE_ACK: u8 = 40;
+/// Stop sending on this stream (proposal 324 §4.1). Only ever seen on a
+/// circuit running congestion control, which has no stream windows.
+pub const RELAY_XOFF: u8 = 43;
+/// Resume sending, with the far end's drain rate as advice.
+pub const RELAY_XON: u8 = 44;
 
 /// Relay header: command, recognized, stream ID, digest, length.
 const RELAY_HEADER_LEN: usize = 11;
@@ -70,6 +76,12 @@ const SENDME_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on queued control replies, so a relay that floods us with them cannot
 /// grow the queue without bound.
 const MAX_QUEUED_CONTROL: usize = 16;
+
+/// ntor-v3 extension asking the far end for proposal 324 congestion control.
+/// Empty body (tor-spec/create-created-cells.md, `CC_FIELD_REQUEST`).
+const EXT_CC_REQUEST: u8 = 1;
+/// Its answer, one byte: the SENDME increment the circuit will run on.
+const EXT_CC_RESPONSE: u8 = 2;
 
 /// END reason codes (tor-spec/closing-streams.md).
 pub const END_REASON_MISC: u8 = 1;
@@ -211,13 +223,96 @@ impl Hop {
     }
 }
 
+/// How a circuit paces itself.
+///
+/// The window scheme of tor-spec/flow-control.md is what a circuit gets
+/// unless its far end agreed to proposal 324's congestion control during the
+/// ntor-v3 handshake. The two differ in more than their arithmetic: with
+/// windows a SENDME arrives every hundred cells and each stream has a window
+/// of its own, while with congestion control a SENDME arrives every
+/// `sendme_inc` cells, the window is sized from the round-trip time, and
+/// streams are paced with XON/XOFF instead.
+enum FlowControl {
+    Window {
+        /// How many more RELAY_DATA cells we may send before a SENDME.
+        package: i32,
+        /// How many more we will accept before sending one.
+        deliver: i32,
+    },
+    Congestion {
+        vegas: cc::Vegas,
+        delivered: cc::DeliverCounter,
+        /// How much unread data one stream may hold before its far end is
+        /// asked to stop, in bytes.
+        xoff_bytes: usize,
+    },
+}
+
+impl FlowControl {
+    fn windows() -> Self {
+        Self::Window {
+            package: CIRCUIT_WINDOW_START,
+            deliver: CIRCUIT_WINDOW_START,
+        }
+    }
+
+    /// May another RELAY_DATA cell go out right now?
+    fn may_send(&self) -> bool {
+        match self {
+            Self::Window { package, .. } => *package > 0,
+            Self::Congestion { vegas, .. } => vegas.can_send(),
+        }
+    }
+
+    fn note_sent(&mut self, now: Instant) {
+        match self {
+            Self::Window { package, .. } => *package -= 1,
+            Self::Congestion { vegas, .. } => vegas.on_send(now),
+        }
+    }
+
+    /// Account for a received RELAY_DATA cell. True means "acknowledge now".
+    fn note_received(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Window { deliver, .. } => {
+                *deliver -= 1;
+                if *deliver < 0 {
+                    return Err(invalid_data("peer overran the circuit deliver window"));
+                }
+                // Acknowledge a whole increment as soon as one is outstanding.
+                if *deliver <= CIRCUIT_WINDOW_START - CIRCUIT_WINDOW_INCREMENT {
+                    *deliver += CIRCUIT_WINDOW_INCREMENT;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Self::Congestion { delivered, .. } => Ok(delivered.on_data()),
+        }
+    }
+
+    /// Account for a circuit-level SENDME.
+    fn note_sendme(&mut self, now: Instant) -> io::Result<()> {
+        match self {
+            Self::Window { package, .. } => {
+                *package += CIRCUIT_WINDOW_INCREMENT;
+                Ok(())
+            }
+            Self::Congestion { vegas, .. } => vegas.on_sendme(now),
+        }
+    }
+
+    fn xoff_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Window { .. } => None,
+            Self::Congestion { xoff_bytes, .. } => Some(*xoff_bytes),
+        }
+    }
+}
+
 struct State {
     hops: Vec<Hop>,
     relay_early_left: u8,
-    /// How many more RELAY_DATA cells we may send before a SENDME.
-    package_window: i32,
-    /// How many more RELAY_DATA cells we will accept before sending a SENDME.
-    deliver_window: i32,
+    flow: FlowControl,
     next_stream_id: u16,
     /// Filled in by the pump when a CREATED2 or EXTENDED2 arrives.
     handshake: Option<Result<Vec<u8>, String>>,
@@ -302,8 +397,7 @@ impl Circuit {
             state: Mutex::new(State {
                 hops: Vec::new(),
                 relay_early_left: MAX_RELAY_EARLY,
-                package_window: CIRCUIT_WINDOW_START,
-                deliver_window: CIRCUIT_WINDOW_START,
+                flow: FlowControl::windows(),
                 next_stream_id: 1,
                 handshake: None,
                 control: VecDeque::new(),
@@ -374,15 +468,40 @@ impl Circuit {
     /// Extend the circuit by one hop with EXTEND2, which must travel in a
     /// RELAY_EARLY cell.
     pub fn extend(&self, next: &RelayInfo) -> io::Result<()> {
-        let (handshake, htype, skin) = Handshake::start(next, &[])?;
+        self.extend_with(next, None)
+    }
+
+    /// Extend, optionally asking the new hop -- which must be the last one --
+    /// to run congestion control.
+    ///
+    /// Only the far end of a circuit negotiates it: the intermediate hops
+    /// forward cells and have no window of their own to manage.
+    pub fn extend_with(
+        &self,
+        next: &RelayInfo,
+        congestion: Option<cc::CcParams>,
+    ) -> io::Result<()> {
+        // ntor-v3 is what carries the request, and a relay with no Ed25519
+        // identity in the directory cannot speak it.
+        let asking = congestion.filter(|p| p.alg == 2 && next.ed_identity.is_some());
+        let extensions = match asking {
+            Some(_) => vec![Extension {
+                kind: EXT_CC_REQUEST,
+                body: Vec::new(),
+            }],
+            None => Vec::new(),
+        };
+        let (handshake, htype, skin) = Handshake::start(next, &extensions)?;
         let payload = build_extend2(next, htype, &skin);
 
         let last_hop = self.last_hop()?;
         self.send_relay(last_hop, RELAY_EXTEND2, 0, &payload, true)?;
 
         let reply = self.wait_for_handshake()?;
-        let (keys, _extensions) = handshake.finish(&reply)?;
-        self.inner.state.lock().unwrap().hops.push(Hop::new(&keys));
+        let (keys, answered) = handshake.finish(&reply)?;
+        let mut state = self.inner.state.lock().unwrap();
+        state.hops.push(Hop::new(&keys));
+        drop(state);
         debug!(
             "circuit {}: hop {} established via {} with {}",
             self.inner.circ_id,
@@ -390,6 +509,56 @@ impl Circuit {
             next.addr,
             handshake_name(htype)
         );
+
+        if let Some(params) = asking {
+            self.adopt_congestion_control(&answered, params)?;
+        }
+        Ok(())
+    }
+
+    /// Take up congestion control if the relay agreed to it.
+    ///
+    /// A relay that answers with an increment far from the one the consensus
+    /// names is refused rather than humoured: the two sides would then count
+    /// SENDMEs differently, and the far end would tear the circuit down as
+    /// soon as the cadence drifted.
+    fn adopt_congestion_control(
+        &self,
+        answered: &[Extension],
+        params: cc::CcParams,
+    ) -> io::Result<()> {
+        let Some(field) = answered.iter().find(|e| e.kind == EXT_CC_RESPONSE) else {
+            // No answer means the window scheme, which is already in place.
+            debug!(
+                "circuit {}: the far end declined congestion control",
+                self.inner.circ_id
+            );
+            return Ok(());
+        };
+        let [sendme_inc] = field.body[..] else {
+            return Err(invalid_data("congestion control answer is not one byte"));
+        };
+        let expected = params.sendme_inc as u32;
+        let offered = sendme_inc as u32;
+        if sendme_inc == 0 || offered * 2 < expected || offered > expected * 2 {
+            return Err(invalid_data(format!(
+                "relay wants a SENDME every {offered} cells, but the consensus says {expected}"
+            )));
+        }
+
+        let vegas = cc::Vegas::new(params, sendme_inc);
+        debug!(
+            "circuit {}: congestion control on, window {} cells, a SENDME every {}",
+            self.inner.circ_id,
+            vegas.cwnd(),
+            vegas.sendme_inc()
+        );
+        let mut state = self.inner.state.lock().unwrap();
+        state.flow = FlowControl::Congestion {
+            vegas,
+            delivered: cc::DeliverCounter::new(sendme_inc),
+            xoff_bytes: params.xoff_client as usize * RELAY_DATA_MAX,
+        };
         Ok(())
     }
 
@@ -462,6 +631,30 @@ impl Circuit {
     pub fn send_control(&self, relay_command: u8, payload: &[u8]) -> io::Result<()> {
         let hop = self.last_hop()?;
         self.send_relay(hop, relay_command, 0, payload, false)
+    }
+
+    /// Run this circuit under congestion control, as agreed out of band.
+    ///
+    /// A rendezvous circuit cannot negotiate through ntor-v3 -- neither the
+    /// rendezvous point nor the introduction point speaks it on the service's
+    /// behalf -- so the agreement is made by the service publishing a
+    /// `flow-control` line and the client answering with an INTRODUCE1
+    /// extension (proposal 324 §9).
+    pub fn use_congestion_control(&self, params: cc::CcParams, sendme_inc: u8) {
+        let vegas = cc::Vegas::new(params, sendme_inc);
+        debug!(
+            "circuit {}: congestion control on with the service, window {} cells, \
+             a SENDME every {}",
+            self.inner.circ_id,
+            vegas.cwnd(),
+            vegas.sendme_inc()
+        );
+        let mut state = self.inner.state.lock().unwrap();
+        state.flow = FlowControl::Congestion {
+            vegas,
+            delivered: cc::DeliverCounter::new(sendme_inc),
+            xoff_bytes: params.xoff_client as usize * RELAY_DATA_MAX,
+        };
     }
 
     /// Add the onion service at the far end of a rendezvous circuit as a
@@ -566,9 +759,13 @@ impl Circuit {
     fn open_stream(&self, relay_command: u8, payload: &[u8]) -> io::Result<TorStream> {
         let hop = self.last_hop()?;
         let stream_id = self.alloc_stream_id()?;
+        // The circuit's flow control is settled before any stream is opened,
+        // so which scheme this stream uses is fixed here and never changes.
+        let xoff_bytes = self.inner.state.lock().unwrap().flow.xoff_bytes();
         let shared = Arc::new(StreamShared {
             id: stream_id,
             hop,
+            xoff_bytes,
             buf: Mutex::new(StreamBuf {
                 data: VecDeque::new(),
                 connected: false,
@@ -577,6 +774,8 @@ impl Circuit {
                 deliver_window: STREAM_WINDOW_START,
                 package_window: STREAM_WINDOW_START,
                 unacked: 0,
+                send_blocked: false,
+                xoff_sent: false,
             }),
             cond: Condvar::new(),
         });
@@ -615,7 +814,7 @@ impl Circuit {
         // that would let it go.
         let deadline = Instant::now() + SENDME_TIMEOUT;
         let mut state = self.inner.state.lock().unwrap();
-        while state.package_window <= 0 {
+        while !state.flow.may_send() {
             if self.is_closed() {
                 return Err(circuit_closed());
             }
@@ -633,7 +832,7 @@ impl Circuit {
                 .unwrap();
             state = guard;
         }
-        state.package_window -= 1;
+        state.flow.note_sent(Instant::now());
         drop(state);
 
         let _order = self.inner.send_order.lock().unwrap();
@@ -906,7 +1105,7 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
         }
         RELAY_SENDME => {
             if stream_id == 0 {
-                state.package_window += CIRCUIT_WINDOW_INCREMENT;
+                state.flow.note_sendme(Instant::now())?;
                 drop(state);
                 inner.event.notify_all();
             } else {
@@ -920,15 +1119,9 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
             }
         }
         RELAY_DATA => {
-            state.deliver_window -= 1;
-            if state.deliver_window < 0 {
-                return Err(invalid_data("peer overran the circuit deliver window"));
-            }
-            // Acknowledge a whole increment as soon as one is outstanding; the
-            // digest we quote is the one from this triggering cell.
-            let sendme = if state.deliver_window <= CIRCUIT_WINDOW_START - CIRCUIT_WINDOW_INCREMENT
-            {
-                state.deliver_window += CIRCUIT_WINDOW_INCREMENT;
+            // The digest a SENDME quotes is the one from the cell that
+            // triggered it, so this has to happen here rather than later.
+            let sendme = if state.flow.note_received()? {
                 let mut payload = Vec::with_capacity(23);
                 payload.push(1); // authenticated SENDME
                 payload.extend_from_slice(&20u16.to_be_bytes());
@@ -956,8 +1149,25 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
                     buf.deliver_window -= 1;
                     buf.unacked += 1;
                     buf.data.extend(payload.iter().copied());
+                    // With congestion control the circuit acknowledges cells
+                    // as soon as they are decrypted, so nothing but XOFF stops
+                    // a slow reader from being buried (proposal 324 4.1.1).
+                    let stop = match stream.xoff_bytes {
+                        Some(limit) => !buf.xoff_sent && buf.data.len() > limit,
+                        None => false,
+                    };
+                    if stop {
+                        buf.xoff_sent = true;
+                    }
                     drop(buf);
                     stream.cond.notify_all();
+                    if stop {
+                        debug!(
+                            "circuit {}: stream {stream_id} is backed up; sending XOFF",
+                            inner.circ_id
+                        );
+                        send_prebuilt(inner, hop, RELAY_XOFF, stream_id, &[0])?;
+                    }
                 }
                 None => trace!(
                     "circuit {}: data for unknown stream {stream_id}",
@@ -992,6 +1202,28 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
                 format!("circuit truncated, reason {reason}"),
             ));
         }
+        RELAY_XOFF | RELAY_XON => {
+            // Both carry a version byte, and only version 0 is defined.
+            if data.first().copied().unwrap_or(0) != 0 {
+                return Err(invalid_data("unknown XON/XOFF version"));
+            }
+            drop(state);
+            if let Some(stream) = lookup(inner, stream_id) {
+                let mut buf = stream.buf.lock().unwrap();
+                buf.send_blocked = relay_command == RELAY_XOFF;
+                drop(buf);
+                stream.cond.notify_all();
+                debug!(
+                    "circuit {}: stream {stream_id} was told to {}",
+                    inner.circ_id,
+                    if relay_command == RELAY_XOFF {
+                        "stop"
+                    } else {
+                        "carry on"
+                    }
+                );
+            }
+        }
         RELAY_RENDEZVOUS_ESTABLISHED | RELAY_INTRODUCE_ACK | RELAY_RENDEZVOUS2 => {
             state.push_control(relay_command, data.to_vec());
             drop(state);
@@ -1003,6 +1235,29 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Send a relay cell from inside the pump, which is already holding the
+/// ordering lock and must not take it again.
+fn send_prebuilt(
+    inner: &Arc<Inner>,
+    hop: usize,
+    relay_command: u8,
+    stream_id: u16,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut state = inner.state.lock().unwrap();
+    let cell = build_relay_cell(
+        &mut state,
+        inner.circ_id,
+        hop,
+        relay_command,
+        stream_id,
+        data,
+        false,
+    )?;
+    drop(state);
+    inner.chan.send_cell(&cell)
 }
 
 fn lookup(inner: &Arc<Inner>, stream_id: u16) -> Option<Arc<StreamShared>> {
@@ -1030,6 +1285,9 @@ fn fail_all(inner: &Arc<Inner>, reason: &str) {
 struct StreamShared {
     id: u16,
     hop: usize,
+    /// How much unread data may pile up before the far end is asked to stop,
+    /// or `None` on a circuit still using stream windows.
+    xoff_bytes: Option<usize>,
     buf: Mutex<StreamBuf>,
     cond: Condvar,
 }
@@ -1044,6 +1302,11 @@ struct StreamBuf {
     package_window: i32,
     /// Received cells not yet acknowledged with a stream SENDME.
     unacked: i32,
+    /// The far end sent XOFF: stop sending until it sends XON. Used only on a
+    /// congestion-controlled circuit, where streams have no windows.
+    send_blocked: bool,
+    /// We have sent XOFF and owe the far end an XON.
+    xoff_sent: bool,
 }
 
 /// How many bytes written before the far end confirms the stream are kept, in
@@ -1223,10 +1486,36 @@ impl TorStream {
         }
     }
 
-    /// Ask the far end for another increment once the application has drained
-    /// enough of the buffer; this is what stops a slow reader from being sent
-    /// more than it can hold.
-    fn maybe_send_sendme(&self, live: &Live) -> io::Result<()> {
+    /// Tell the far end it may send more, now that the application has taken
+    /// some of the buffer away. This is what stops a slow reader from being
+    /// sent more than it can hold.
+    ///
+    /// Which message says so depends on the circuit: a stream SENDME under the
+    /// window scheme, an XON on a congestion-controlled circuit, where streams
+    /// have no windows of their own.
+    fn release_backpressure(&self, live: &Live) -> io::Result<()> {
+        if let Some(limit) = live.shared.xoff_bytes {
+            let mut buf = live.shared.buf.lock().unwrap();
+            // Half the limit, so that a reader hovering around the threshold
+            // does not make us alternate XOFF and XON on every cell.
+            if !buf.xoff_sent || buf.data.len() > limit / 2 {
+                return Ok(());
+            }
+            buf.xoff_sent = false;
+            drop(buf);
+            // A zero rate means "no limit", which is the only honest thing we
+            // can say: the drain rate here is whatever the SOCKS client does.
+            let mut body = vec![0u8];
+            body.extend_from_slice(&0u32.to_be_bytes());
+            return live.circuit.send_relay(
+                live.shared.hop,
+                RELAY_XON,
+                live.shared.id,
+                &body,
+                false,
+            );
+        }
+
         loop {
             let mut buf = live.shared.buf.lock().unwrap();
             let backlog_low = buf.data.len() <= STREAM_WINDOW_INCREMENT as usize * RELAY_DATA_MAX;
@@ -1353,7 +1642,7 @@ impl io::Read for TorStream {
                     // Anything at all coming back means the far end answered,
                     // so there is no longer anything to replay.
                     self.note_established();
-                    self.maybe_send_sendme(&live)?;
+                    self.release_backpressure(&live)?;
                     return Ok(n);
                 }
                 Err(e) if self.may_retry(&e) => {
@@ -1450,8 +1739,7 @@ mod tests {
         State {
             hops: all.iter().map(Hop::new).collect(),
             relay_early_left: MAX_RELAY_EARLY,
-            package_window: CIRCUIT_WINDOW_START,
-            deliver_window: CIRCUIT_WINDOW_START,
+            flow: FlowControl::windows(),
             next_stream_id: 1,
             handshake: None,
             control: VecDeque::new(),

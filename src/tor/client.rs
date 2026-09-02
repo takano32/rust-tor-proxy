@@ -504,7 +504,12 @@ impl TorClient {
             .get(&exit.microdesc_digest)
             .cloned()
             .ok_or_else(|| invalid_data("exit microdescriptor vanished"))?;
-        stub.circuit.extend(&relay_info(exit, &exit_md))?;
+        // The exit is the far end of this circuit, so it is the hop that
+        // negotiates congestion control.
+        stub.circuit.extend_with(
+            &relay_info(exit, &exit_md),
+            Some(directory.consensus.params.cc_exit),
+        )?;
         crate::debug!(
             "circuit {} completed to exit {}",
             stub.circuit.circ_id(),
@@ -1413,10 +1418,17 @@ impl TorClient {
             .map_err(|_| invalid_data("onion service descriptor is not UTF-8"))?;
         let descriptor = Descriptor::parse(&text, blinded, subcredential, now_unix())?;
         crate::debug!(
-            "descriptor from {}: revision {}, {} introduction points",
+            "descriptor from {}: revision {}, {} introduction points, flow control {}",
             hex_encode(&identity[..4]),
             descriptor.revision_counter,
-            descriptor.intro_points.len()
+            descriptor.intro_points.len(),
+            match descriptor.flow_control {
+                Some(flow) => format!(
+                    "up to version {} with a SENDME every {}",
+                    flow.max_version, flow.sendme_inc
+                ),
+                None => "not advertised".to_string(),
+            }
         );
         Ok(descriptor)
     }

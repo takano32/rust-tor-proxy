@@ -14,11 +14,12 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::descriptor::{Descriptor, IntroPoint};
+use super::descriptor::{Descriptor, FlowControl, IntroPoint};
 use super::mac;
 use super::ntor::{HsNtorClient, IntroduceKeys, SERVER_HANDSHAKE_LEN};
 use crate::ffi::aes::Aes256Ctr;
 use crate::ffi::rand;
+use crate::tor::cc;
 use crate::tor::circuit::{
     Circuit, RELAY_ESTABLISH_RENDEZVOUS, RELAY_INTRODUCE1, RELAY_INTRODUCE_ACK, RELAY_RENDEZVOUS2,
     RELAY_RENDEZVOUS_ESTABLISHED,
@@ -26,6 +27,12 @@ use crate::tor::circuit::{
 use crate::tor::client::TorClient;
 use crate::tor::RelayInfo;
 use crate::util::invalid_data;
+
+/// The INTRODUCE1 extension that asks the service for congestion control
+/// (proposal 324 §9.2). Zero-length body; its presence is the request.
+const EXT_CC_REQUEST: u8 = 1;
+/// The `flow-control` version that means proposal 324.
+const FLOW_CONTROL_VERSION: u8 = 2;
 
 /// AUTH_KEY_TYPE: an Ed25519 public key is the only value defined.
 const AUTH_KEY_TYPE_ED25519: u8 = 0x02;
@@ -133,15 +140,14 @@ pub fn establish(
         }
     };
 
-    match introduce_until_met(
-        client,
-        &rendezvous,
+    let plan = Plan {
         descriptor,
         subcredential,
-        &order,
-        &mut prepared,
+        order: &order,
+        congestion: congestion_terms(client, descriptor),
         deadline,
-    ) {
+    };
+    match introduce_until_met(client, &rendezvous, &plan, &mut prepared) {
         Ok(()) => Ok(rendezvous.circuit),
         Err(failure) => {
             rendezvous.circuit.close();
@@ -151,6 +157,57 @@ pub fn establish(
             Err(failure)
         }
     }
+}
+
+/// What one round of introduction attempts needs, beyond the rendezvous side.
+#[derive(Clone, Copy)]
+struct Plan<'a> {
+    descriptor: &'a Descriptor,
+    subcredential: &'a [u8; 32],
+    /// The introduction points to try, in the order to try them.
+    order: &'a [usize],
+    /// The congestion control terms to ask for, if any.
+    congestion: Option<(cc::CcParams, u8)>,
+    deadline: Instant,
+}
+
+/// Whether to ask the service for congestion control, and on what terms.
+///
+/// The service publishes a `flow-control` line only when it has congestion
+/// control enabled, so its absence settles the matter. A `sendme-inc` far from
+/// the consensus value means the service and this client are working from
+/// different consensuses; proposal 324 says to reject such a descriptor, but
+/// falling back to the window scheme reaches the service instead of refusing
+/// to, and the service will do the same because it never sees the extension.
+fn congestion_terms(
+    client: &Arc<TorClient>,
+    descriptor: &Descriptor,
+) -> Option<(cc::CcParams, u8)> {
+    congestion_from(
+        descriptor.flow_control,
+        client.directory().consensus.params.cc_onion,
+    )
+}
+
+/// The decision itself, apart from where the two inputs come from.
+fn congestion_from(
+    advertised: Option<FlowControl>,
+    params: cc::CcParams,
+) -> Option<(cc::CcParams, u8)> {
+    let advertised = advertised?;
+    if advertised.max_version < FLOW_CONTROL_VERSION || params.alg == 0 {
+        return None;
+    }
+    let expected = params.sendme_inc as u32;
+    let offered = advertised.sendme_inc as u32;
+    if offered == 0 || offered * 2 < expected || offered > expected * 2 {
+        crate::warn!(
+            "the service wants a SENDME every {offered} cells and the consensus says \
+             {expected}; using the window scheme instead"
+        );
+        return None;
+    }
+    Some((params, advertised.sendme_inc))
 }
 
 /// Build the rendezvous circuit and leave the cookie at its far end.
@@ -189,12 +246,16 @@ fn open_rendezvous(client: &Arc<TorClient>) -> io::Result<Rendezvous> {
 fn introduce_until_met(
     client: &Arc<TorClient>,
     rendezvous: &Rendezvous,
-    descriptor: &Descriptor,
-    subcredential: &[u8; 32],
-    order: &[usize],
+    plan: &Plan<'_>,
     prepared: &mut Option<(usize, Circuit)>,
-    deadline: Instant,
 ) -> Result<(), Failure> {
+    let Plan {
+        descriptor,
+        subcredential,
+        order,
+        congestion,
+        deadline,
+    } = *plan;
     let mut last: Option<io::Error> = None;
     let mut all_unrecognized = true;
     let mut attempts = 0usize;
@@ -217,7 +278,7 @@ fn introduce_until_met(
         };
         let intro = &descriptor.intro_points[index];
         attempts += 1;
-        match introduce(client, rendezvous, intro, subcredential, ready) {
+        match introduce(client, rendezvous, intro, subcredential, ready, congestion) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 crate::debug!("introduction point {}: {e}", intro.relay.addr);
@@ -244,10 +305,12 @@ fn introduce(
     intro: &IntroPoint,
     subcredential: &[u8; 32],
     ready: Option<Circuit>,
+    congestion: Option<(cc::CcParams, u8)>,
 ) -> io::Result<()> {
     let handshake = HsNtorClient::new(&intro.auth_key, &intro.enc_key)?;
     let keys = handshake.introduce_keys(subcredential);
-    let plaintext = introduce_plaintext(&rendezvous.cookie, &rendezvous.point);
+    let plaintext =
+        introduce_plaintext(&rendezvous.cookie, &rendezvous.point, congestion.is_some());
     let message = assemble_introduce1(
         &intro.auth_key,
         &handshake.client_public(),
@@ -276,14 +339,31 @@ fn introduce(
     }
     let circuit_keys = handshake.finish(&reply)?;
     rendezvous.circuit.add_virtual_hop(&circuit_keys);
+    // The service applies congestion control exactly when it saw the
+    // extension, so this side switches over unconditionally rather than
+    // waiting for a reply -- hs-ntor has no room for one.
+    if let Some((params, sendme_inc)) = congestion {
+        rendezvous
+            .circuit
+            .use_congestion_control(params, sendme_inc);
+    }
     Ok(())
 }
 
 /// The plaintext the service decrypts: where to meet, and with which key.
-fn introduce_plaintext(cookie: &[u8; 20], rendezvous_point: &RelayInfo) -> Vec<u8> {
+fn introduce_plaintext(
+    cookie: &[u8; 20],
+    rendezvous_point: &RelayInfo,
+    request_congestion: bool,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(INTRODUCE_PLAINTEXT_LEN);
     out.extend_from_slice(cookie);
-    out.push(0); // no extensions
+    if request_congestion {
+        // One extension: N_EXTENSIONS, then TYPE and LEN with no body.
+        out.extend_from_slice(&[1, EXT_CC_REQUEST, 0]);
+    } else {
+        out.push(0);
+    }
     out.push(ONION_KEY_TYPE_NTOR);
     out.extend_from_slice(&(rendezvous_point.ntor_onion_key.len() as u16).to_be_bytes());
     out.extend_from_slice(&rendezvous_point.ntor_onion_key);
@@ -404,6 +484,92 @@ mod tests {
         assert_eq!(message[55], 0);
     }
 
+    /// The service publishes its terms; the client decides from them and the
+    /// consensus whether to ask for congestion control at all.
+    #[test]
+    fn congestion_is_asked_for_only_when_both_sides_agree() {
+        let params = cc::CcParams::defaults(cc::Position::Onion);
+        let inc = params.sendme_inc;
+
+        // No line at all means the service has congestion control off.
+        assert!(congestion_from(None, params).is_none());
+        // Only version 1: the old window scheme.
+        let old = FlowControl {
+            max_version: 1,
+            sendme_inc: inc,
+        };
+        assert!(congestion_from(Some(old), params).is_none());
+        // Agreed.
+        let good = FlowControl {
+            max_version: 2,
+            sendme_inc: inc,
+        };
+        assert_eq!(congestion_from(Some(good), params), Some((params, inc)));
+        // A newer version than we know still offers 2.
+        let newer = FlowControl {
+            max_version: 5,
+            sendme_inc: inc,
+        };
+        assert_eq!(congestion_from(Some(newer), params), Some((params, inc)));
+
+        // The consensus can switch it off for everyone.
+        let mut off = params;
+        off.alg = 0;
+        assert!(congestion_from(Some(good), off).is_none());
+
+        // Within a factor of two either way is accepted; beyond it the two
+        // sides are working from different consensuses. With an odd
+        // increment the lower bound rounds up: half of 31 is 15.5, so 16 is
+        // the smallest value still within a factor of two.
+        for offered in [inc.div_ceil(2), inc * 2] {
+            let terms = FlowControl {
+                max_version: 2,
+                sendme_inc: offered,
+            };
+            assert_eq!(
+                congestion_from(Some(terms), params),
+                Some((params, offered)),
+                "sendme_inc {offered}"
+            );
+        }
+        for offered in [0, inc / 2, inc * 2 + 1] {
+            let terms = FlowControl {
+                max_version: 2,
+                sendme_inc: offered,
+            };
+            assert!(
+                congestion_from(Some(terms), params).is_none(),
+                "sendme_inc {offered}"
+            );
+        }
+    }
+
+    /// The request is one zero-length extension in the encrypted plaintext,
+    /// and it must not disturb anything after it.
+    #[test]
+    fn the_congestion_request_rides_in_the_plaintext() {
+        let relay = RelayInfo {
+            addr: "10.9.8.7:9001".parse().unwrap(),
+            rsa_identity: [0xa1; 20],
+            ed_identity: Some([0xb2; 32]),
+            ntor_onion_key: [0xc3; 32],
+        };
+        let cookie = [0x5a; 20];
+        let plain = introduce_plaintext(&cookie, &relay, false);
+        let asking = introduce_plaintext(&cookie, &relay, true);
+
+        assert_eq!(plain[20], 0, "no extensions");
+        assert_eq!(&asking[20..23], &[1, EXT_CC_REQUEST, 0]);
+        // Both are padded to the same length, so the request does not show
+        // through as a longer cell.
+        assert_eq!(plain.len(), asking.len());
+        assert_eq!(plain.len(), INTRODUCE_PLAINTEXT_LEN);
+        // The onion key still follows the extension list in both.
+        assert_eq!(plain[21], ONION_KEY_TYPE_NTOR);
+        assert_eq!(asking[23], ONION_KEY_TYPE_NTOR);
+        assert_eq!(&asking[26..58], &relay.ntor_onion_key);
+    }
+
     #[test]
     fn plaintext_is_padded_to_a_fixed_length() {
         let relay = RelayInfo {
@@ -413,7 +579,7 @@ mod tests {
             ntor_onion_key: [0xc3; 32],
         };
         let cookie = [0x5a; 20];
-        let plaintext = introduce_plaintext(&cookie, &relay);
+        let plaintext = introduce_plaintext(&cookie, &relay, false);
         assert_eq!(plaintext.len(), INTRODUCE_PLAINTEXT_LEN);
         assert_eq!(&plaintext[..20], &cookie);
         assert_eq!(plaintext[20], 0, "no extensions");

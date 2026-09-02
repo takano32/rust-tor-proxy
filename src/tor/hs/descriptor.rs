@@ -54,6 +54,41 @@ pub struct Descriptor {
     pub lifetime_minutes: u64,
     pub revision_counter: u64,
     pub intro_points: Vec<IntroPoint>,
+    /// What the inner layer's `flow-control` line said, when it had one.
+    pub flow_control: Option<FlowControl>,
+}
+
+/// The service's `flow-control version-range sendme-inc` line (proposal 324
+/// §9.1). A service only publishes it when it has congestion control enabled,
+/// so its absence means the window scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowControl {
+    /// The highest protocol version the service offers. 2 is the one that
+    /// means proposal 324.
+    pub max_version: u8,
+    /// The service's view of the consensus `cc_sendme_inc`.
+    pub sendme_inc: u8,
+}
+
+impl FlowControl {
+    /// `"flow-control" SP version-range SP sendme-inc`, where the range is a
+    /// dash-separated pair such as `1-2`.
+    ///
+    /// Unknown versions are ignored rather than refused, and so is anything
+    /// further along the line, as the spec requires.
+    fn parse(args: &str) -> Option<Self> {
+        let mut fields = args.split_whitespace();
+        let range = fields.next()?;
+        let sendme_inc: u8 = fields.next()?.parse().ok()?;
+        let max_version = range
+            .split('-')
+            .filter_map(|v| v.parse::<u8>().ok())
+            .max()?;
+        Some(Self {
+            max_version,
+            sendme_inc,
+        })
+    }
 }
 
 impl Descriptor {
@@ -115,10 +150,12 @@ impl Descriptor {
         )?;
 
         let intro_points = parse_inner(&inner, &signing_key, now)?;
+        let flow_control = netdoc::item(&inner, "flow-control").and_then(FlowControl::parse);
         Ok(Self {
             lifetime_minutes,
             revision_counter,
             intro_points,
+            flow_control,
         })
     }
 }
@@ -383,6 +420,24 @@ fn parse_link_specifiers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service's flow-control line: the highest version it offers, and
+    /// its view of the consensus SENDME increment.
+    #[test]
+    fn flow_control_line() {
+        let parsed = FlowControl::parse("1-2 31").unwrap();
+        assert_eq!(parsed.max_version, 2);
+        assert_eq!(parsed.sendme_inc, 31);
+        // Unknown versions are ignored rather than refused, and so is
+        // anything further along the line.
+        assert_eq!(FlowControl::parse("2-5 50 extra").unwrap().max_version, 5);
+        assert_eq!(FlowControl::parse("1 100").unwrap().max_version, 1);
+        // A malformed line is simply absent, not fatal.
+        assert!(FlowControl::parse("").is_none());
+        assert!(FlowControl::parse("1-2").is_none());
+        assert!(FlowControl::parse("1-2 not-a-number").is_none());
+        assert!(FlowControl::parse("x-y 31").is_none());
+    }
     use crate::util::{base64_encode_unpadded, hex_decode};
 
     /// `unwrap_err` needs `Debug` on the success type, and neither a

@@ -11,6 +11,7 @@ use std::io;
 use super::authority::{self, KeyCertificate, AUTHORITIES};
 use super::netdoc;
 use crate::ffi::hash::{sha1, sha256};
+use crate::tor::cc;
 use crate::util::{hex_decode, invalid_data, parse_datetime};
 
 pub const FLAG_AUTHORITY: u16 = 1 << 0;
@@ -173,6 +174,11 @@ pub struct Params {
     /// path just as the parameters are, so it is kept and filled alongside
     /// them.
     pub bandwidth_weights: BandwidthWeights,
+    /// The `cc_*` parameters, resolved for each of the two positions that
+    /// have their own tuning. Kept rather than the `params` text, which is
+    /// dropped with the rest of the document.
+    pub cc_exit: cc::CcParams,
+    pub cc_onion: cc::CcParams,
 }
 
 impl Default for Params {
@@ -182,6 +188,8 @@ impl Default for Params {
             hsdir_n_replicas: 2,
             hsdir_spread_fetch: 3,
             bandwidth_weights: BandwidthWeights::default(),
+            cc_exit: cc::CcParams::defaults(cc::Position::Exit),
+            cc_onion: cc::CcParams::defaults(cc::Position::Onion),
         }
     }
 }
@@ -196,6 +204,10 @@ impl Params {
             .unwrap_or_default();
         if let Some(args) = netdoc::item(text, "bandwidth-weights") {
             out.bandwidth_weights = BandwidthWeights::parse(args);
+        }
+        if let Some(args) = netdoc::item(text, "params") {
+            out.cc_exit = cc::CcParams::parse(args, cc::Position::Exit);
+            out.cc_onion = cc::CcParams::parse(args, cc::Position::Onion);
         }
         out
     }

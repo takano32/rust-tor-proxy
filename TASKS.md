@@ -1188,15 +1188,15 @@ tor-spec/create-created-cells.md の ntor-v3 節(proposal 332)を正とする。
 proposal 324(`324-rtt-congestion-control.txt`)と param-spec.md の `cc_*` を正とする。
 C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
 
-- [ ] **交渉**: 終端ホップ(exit、または onion service)との ntor-v3 に拡張 `TYPE=01`
+- [x] **交渉**: 終端ホップ(exit、または onion service)との ntor-v3 に拡張 `TYPE=01`
       (cc 要求、本体なし)を入れる。応答の `TYPE=02` の本体 `sendme_inc(1)` を採用する
       (現在 31)。応答が無ければその回路は window 方式。**中間ホップとは交渉しない**。
-- [ ] **回路ごとのフロー制御を `enum FlowControl { Window(既存), Congestion(cc::State) }`** にし、
+- [x] **回路ごとのフロー制御を `enum FlowControl { Window(既存), Congestion(cc::State) }`** にし、
       受信・送信処理を分岐する。
-- [ ] **受信側**: `sendme_inc` セルごとに SENDME(version 1、digest 付き。形式は既存)を送る。
+- [x] **受信側**: `sendme_inc` セルごとに SENDME(version 1、digest 付き。形式は既存)を送る。
       100 個ごとの回路 window と 50 個ごとのストリーム window は使わない。
       **周期がずれると相手が回路を切る**ので、カウントは既存の受信ダイジェスト処理と同じ場所で行う。
-- [ ] **送信側**: `inflight = sent − acked`。SENDME 1 個 = `sendme_inc` セルの ACK。
+- [x] **送信側**: `inflight = sent − acked`。SENDME 1 個 = `sendme_inc` セルの ACK。
       `inflight < cwnd` のときだけ送る(既存の package window 待ちと同じ Condvar)。
   - RTT: 送信セルの通し番号が `sendme_inc` の倍数になるたびに `Instant` を控え、対応する
     SENDME が来たら差を取る。`min_rtt` と EWMA(`cc_ewma_cwnd_pct`、上限 `cc_ewma_max`)を持つ。
@@ -1212,17 +1212,17 @@ C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
     `congestion_control_vegas.c` に合わせる**。
   - パラメータは exit 回路には `*_exit`、onion 回路には `*_onion` を使う。既定値は
     param-spec.md、コンセンサス `params` にあればそれを使う(`Params` に追加)。
-- [ ] **ストリームのフロー制御 XON/XOFF**: `RELAY_XOFF = 43`(本体 `version(1)=0`)、
+- [x] **ストリームのフロー制御 XON/XOFF**: `RELAY_XOFF = 43`(本体 `version(1)=0`)、
       `RELAY_XON = 44`(本体 `version(1)=0 | kbps_ewma(4)`)。
   - 受信: 相手からの XOFF でそのストリームの送信を止め、XON で再開する(`TorStream::write` の待ち)。
   - 送信: ストリームの未読バッファが `cc_xoff_client` セル分を超えたら XOFF、
     半分以下に減ったら XON(`kbps_ewma` は 0 = 制限なしでよい)。既存の
     「アプリが読み切ってから SENDME」の仕組みを XON/XOFF に置き換える。
-- [ ] **onion service**: descriptor 内層の `flow-control <range> <sendme_inc>` 行を読む
+- [x] **onion service**: descriptor 内層の `flow-control <range> <sendme_inc>` 行を読む
       (`descriptor.rs`)。range が `2` を含むなら INTRODUCE1 の暗号化部の拡張に `TYPE=01`
       (cc 要求)を入れ、仮想ホップを `Congestion` にする(`sendme_inc` は descriptor の値)。
       無ければ window。
-- [ ] 単体テスト: cc の状態機械を「相手役」を書いて回す(SENDME の周期、cwnd の増減、
+- [x] 単体テスト: cc の状態機械を「相手役」を書いて回す(SENDME の周期、cwnd の増減、
       XOFF で止まり XON で再開、`inflight` の上限)。RTT は `Instant` を注入できる形にして
       決定的にする。
 - 完了条件: 単一ストリームの 10MB ダウンロード(5 回の中央値)が window 方式の **2 倍以上**。
