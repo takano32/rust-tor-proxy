@@ -638,6 +638,15 @@ impl std::fmt::Display for StreamEnd {
 
 impl std::error::Error for StreamEnd {}
 
+/// True when this error carries a RELAY_END reason -- that is, when the far
+/// end answered the request rather than the circuit failing under it.
+pub fn is_stream_end(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<StreamEnd>())
+        .is_some()
+}
+
 impl From<StreamEnd> for io::Error {
     fn from(end: StreamEnd) -> io::Error {
         let kind = match end.0 {
@@ -1424,6 +1433,18 @@ mod tests {
         )
         .is_err());
         assert!(build_relay_cell(&mut state, 1, 5, RELAY_DATA, 1, &[0], false).is_err());
+    }
+
+    /// The distinction the onion path leans on: a RELAY_END is the far end
+    /// answering, while anything else means the circuit let us down.
+    #[test]
+    fn stream_end_errors_are_recognisable() {
+        let answered: io::Error = StreamEnd(END_REASON_DONE).into();
+        assert!(is_stream_end(&answered));
+        assert!(is_stream_end(&StreamEnd(END_REASON_CONNECTREFUSED).into()));
+        assert!(!is_stream_end(&circuit_closed()));
+        assert!(!is_stream_end(&io::Error::other("something else")));
+        assert!(!is_stream_end(&invalid_data("malformed")));
     }
 
     #[test]

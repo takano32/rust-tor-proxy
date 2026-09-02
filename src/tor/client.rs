@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use super::certs::now_unix;
 use super::channel::Channel;
-use super::circuit::{Circuit, TorStream};
+use super::circuit::{self, Circuit, TorStream};
 use super::dir::cache::Cache;
 use super::dir::consensus::{RouterStatus, FLAG_HSDIR};
 use super::dir::microdesc::Microdesc;
@@ -586,6 +586,7 @@ impl TorClient {
             }
         }
 
+        let started = Instant::now();
         let consensus = &self.directory.consensus;
         let period = TimePeriod::containing(valid_after, consensus.params.hsdir_interval);
         let srv = hsdir::shared_random_value(consensus, &period);
@@ -619,7 +620,8 @@ impl TorClient {
             ));
         }
         crate::info!(
-            "HSDir ring ready: {} of {} relays placed",
+            "HSDir ring ready in {:.1}s: {} of {} relays placed",
+            started.elapsed().as_secs_f32(),
             nodes.len(),
             hsdirs.len()
         );
@@ -723,6 +725,11 @@ impl TorClient {
             };
             match circuit.begin_stream_onion(port) {
                 Ok(stream) => return Ok(stream),
+                // A RELAY_END means the service itself answered: it is not
+                // listening on that port. Another rendezvous circuit would
+                // reach the same service and get the same answer, so keep the
+                // circuit and report what it said.
+                Err(e) if circuit::is_stream_end(&e) => return Err(e),
                 Err(e) => {
                     crate::debug!("attempt {}: onion BEGIN failed: {e}", attempt + 1);
                     self.discard_onion_circuit(address);
