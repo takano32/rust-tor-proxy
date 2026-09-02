@@ -128,7 +128,6 @@ struct Inner {
     event: Condvar,
     streams: Mutex<HashMap<u16, Arc<StreamShared>>>,
     closed: AtomicBool,
-    created: Instant,
 }
 
 pub struct Circuit {
@@ -172,7 +171,6 @@ impl Circuit {
             event: Condvar::new(),
             streams: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
-            created: Instant::now(),
         });
 
         let pump_inner = Arc::clone(&inner);
@@ -289,10 +287,6 @@ impl Circuit {
 
     pub fn hop_count(&self) -> usize {
         self.inner.state.lock().unwrap().hops.len()
-    }
-
-    pub fn age(&self) -> Duration {
-        self.inner.created.elapsed()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -609,7 +603,7 @@ fn decrypt_inbound(state: &mut State, body: &mut [u8]) -> Option<usize> {
         let full = trial.peek();
         if full[..4] == claimed {
             state.hops[index].backward_digest = trial;
-            state.last_recv_digest.copy_from_slice(&full[..20]);
+            state.last_recv_digest = full;
             return Some(index);
         }
         body[5..9].copy_from_slice(&claimed);
@@ -810,7 +804,13 @@ fn lookup(inner: &Arc<Inner>, stream_id: u16) -> Option<Arc<StreamShared>> {
 }
 
 fn fail_all(inner: &Arc<Inner>, reason: &str) {
-    let streams: Vec<Arc<StreamShared>> = inner.streams.lock().unwrap().drain().map(|(_, s)| s).collect();
+    let streams: Vec<Arc<StreamShared>> = inner
+        .streams
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, s)| s)
+        .collect();
     for stream in streams {
         let mut buf = stream.buf.lock().unwrap();
         if buf.error.is_none() && buf.ended.is_none() {
@@ -856,10 +856,6 @@ impl TorStream {
         }
     }
 
-    pub fn stream_id(&self) -> u16 {
-        self.shared.id
-    }
-
     /// Ask the far end for another increment once the application has drained
     /// enough of the buffer; this is what stops a slow reader from being sent
     /// more than it can hold.
@@ -887,7 +883,12 @@ impl TorStream {
             &[END_REASON_DONE],
             false,
         );
-        self.circuit.inner.streams.lock().unwrap().remove(&self.shared.id);
+        self.circuit
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .remove(&self.shared.id);
         let mut buf = self.shared.buf.lock().unwrap();
         if buf.ended.is_none() {
             buf.ended = Some(END_REASON_DONE);
@@ -1057,10 +1058,20 @@ mod tests {
                 peer.cipher_from_client.apply(&mut body);
             }
             assert_eq!(body[0], RELAY_DATA);
-            assert_eq!(&body[1..3], &[0, 0], "recognized must be zero at the target");
+            assert_eq!(
+                &body[1..3],
+                &[0, 0],
+                "recognized must be zero at the target"
+            );
             assert_eq!(u16::from_be_bytes([body[3], body[4]]), 7);
-            assert_eq!(u16::from_be_bytes([body[9], body[10]]) as usize, payload.len());
-            assert_eq!(&body[RELAY_HEADER_LEN..RELAY_HEADER_LEN + payload.len()], &payload[..]);
+            assert_eq!(
+                u16::from_be_bytes([body[9], body[10]]) as usize,
+                payload.len()
+            );
+            assert_eq!(
+                &body[RELAY_HEADER_LEN..RELAY_HEADER_LEN + payload.len()],
+                &payload[..]
+            );
 
             let mut claimed = [0u8; 4];
             claimed.copy_from_slice(&body[5..9]);
@@ -1103,12 +1114,20 @@ mod tests {
         }
 
         // Garbage must be rejected without disturbing the digests.
-        let before: Vec<Vec<u8>> = client.hops.iter().map(|h| h.backward_digest.peek()).collect();
+        let before: Vec<[u8; 20]> = client
+            .hops
+            .iter()
+            .map(|h| h.backward_digest.peek())
+            .collect();
         let mut junk = vec![0u8; CELL_BODY_LEN];
         junk[1] = 0;
         junk[2] = 0;
         assert!(decrypt_inbound(&mut client, &mut junk).is_none());
-        let after: Vec<Vec<u8>> = client.hops.iter().map(|h| h.backward_digest.peek()).collect();
+        let after: Vec<[u8; 20]> = client
+            .hops
+            .iter()
+            .map(|h| h.backward_digest.peek())
+            .collect();
         assert_eq!(before, after);
     }
 
@@ -1128,7 +1147,16 @@ mod tests {
     fn rejects_oversized_and_misaddressed_messages() {
         let all = [keys(21)];
         let mut state = state_with_hops(&all);
-        assert!(build_relay_cell(&mut state, 1, 0, RELAY_DATA, 1, &[0; RELAY_DATA_MAX + 1], false).is_err());
+        assert!(build_relay_cell(
+            &mut state,
+            1,
+            0,
+            RELAY_DATA,
+            1,
+            &[0; RELAY_DATA_MAX + 1],
+            false
+        )
+        .is_err());
         assert!(build_relay_cell(&mut state, 1, 5, RELAY_DATA, 1, &[0], false).is_err());
     }
 

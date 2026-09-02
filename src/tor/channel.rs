@@ -25,15 +25,16 @@ use super::cell::{self, Cell};
 use super::certs::{self, CertsCell};
 use crate::ffi::rand;
 use crate::ffi::tls::SslStream;
-use crate::ffi::{poll, PollFd, POLLIN, POLLOUT};
+use crate::ffi::{poll, PollFd, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 use crate::util::invalid_data;
 
 /// Link protocol versions we are willing to speak. v5 is left out on purpose:
 /// it turns on padding negotiation, which we do not implement.
 const SUPPORTED_VERSIONS: [u16; 2] = [3, 4];
 
-/// How long a TCP connect plus TLS plus link handshake may take.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a TCP connect plus TLS plus link handshake may take. Kept short
+/// so that an unreachable relay is abandoned quickly and another can be tried.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on bytes queued for the I/O thread before senders block. Circuit-level
 /// flow control keeps the real figure far below this.
@@ -66,7 +67,10 @@ struct Outbound {
 
 impl Channel {
     /// Open a channel to `peer` and prove it holds `expected_ed_identity`.
-    pub fn connect(peer: SocketAddrV4, expected_ed_identity: Option<&[u8; 32]>) -> io::Result<Self> {
+    pub fn connect(
+        peer: SocketAddrV4,
+        expected_ed_identity: Option<&[u8; 32]>,
+    ) -> io::Result<Self> {
         let sock = TcpStream::connect_timeout(&SocketAddr::V4(peer), HANDSHAKE_TIMEOUT)?;
         let mut tls = SslStream::connect(sock, HANDSHAKE_TIMEOUT)?;
         let tls_cert_sha256 = *tls.peer_cert_sha256();
@@ -356,7 +360,9 @@ fn run_io(tls: &mut SslStream, wake_rx: &mut UnixStream, shared: &Arc<Shared>) -
             }
         }
 
-        let want_write = !pending.is_empty();
+        // A read can also ask to wait for writability, during a TLS key
+        // update; asking for POLLOUT then keeps that from stalling.
+        let want_write = !pending.is_empty() || tls.wants_write();
         let mut fds = [
             PollFd {
                 fd: tls_fd,
@@ -376,6 +382,9 @@ fn run_io(tls: &mut SslStream, wake_rx: &mut UnixStream, shared: &Arc<Shared>) -
                 return Err(err);
             }
         }
+        if fds[0].revents & (POLLERR | POLLHUP | POLLNVAL) != 0 && fds[0].revents & POLLIN == 0 {
+            return Ok(());
+        }
         if fds[1].revents & POLLIN != 0 {
             // Drain the wake-up bytes; their number carries no meaning.
             while let Ok(n) = wake_rx.read(&mut drain_buf) {
@@ -389,14 +398,9 @@ fn run_io(tls: &mut SslStream, wake_rx: &mut UnixStream, shared: &Arc<Shared>) -
 
 fn dispatch_cells(inbound: &mut Vec<u8>, shared: &Arc<Shared>) -> io::Result<()> {
     let mut consumed = 0usize;
-    loop {
-        match Cell::try_parse(&inbound[consumed..], shared.circ_id_len)? {
-            Some((cell, used)) => {
-                consumed += used;
-                deliver(cell, shared);
-            }
-            None => break,
-        }
+    while let Some((cell, used)) = Cell::try_parse(&inbound[consumed..], shared.circ_id_len)? {
+        consumed += used;
+        deliver(cell, shared);
     }
     if consumed > 0 {
         inbound.drain(..consumed);

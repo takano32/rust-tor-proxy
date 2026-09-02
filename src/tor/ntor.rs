@@ -11,11 +11,11 @@
 
 use std::io;
 
+use crate::ffi::constant_time_eq;
 use crate::ffi::hash::sha1;
 use crate::ffi::hmac::hmac_sha256;
 use crate::ffi::rand;
 use crate::ffi::x25519::EphemeralSecret;
-use crate::ffi::constant_time_eq;
 use crate::util::invalid_data;
 
 /// HTYPE for ntor in CREATE2 / EXTEND2.
@@ -115,7 +115,9 @@ impl NtorClient {
 
         let expected_auth = hmac_sha256(T_MAC, &auth_input);
         if !constant_time_eq(&expected_auth, auth) {
-            return Err(invalid_data("ntor AUTH mismatch: relay did not prove its key"));
+            return Err(invalid_data(
+                "ntor AUTH mismatch: relay did not prove its key",
+            ));
         }
 
         Ok(derive_keys(&key_seed))
@@ -205,7 +207,10 @@ impl CreateFastClient {
 
 /// KDF-TOR: `K = SHA1(K0 | [00]) | SHA1(K0 | [01]) | ...`.
 pub fn kdf_tor(k0: &[u8], out_len: usize) -> Vec<u8> {
-    assert!(out_len <= 20 * 256, "KDF-TOR cannot produce that much output");
+    assert!(
+        out_len <= 20 * 256,
+        "KDF-TOR cannot produce that much output"
+    );
     let mut out = Vec::with_capacity(out_len + 20);
     let mut counter: u8 = 0;
     while out.len() < out_len {

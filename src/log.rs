@@ -14,7 +14,11 @@ pub const TRACE: u8 = 4;
 static LEVEL: AtomicU8 = AtomicU8::new(INFO);
 
 pub fn init() {
-    let level = match std::env::var("TOR_LOG").unwrap_or_default().to_lowercase().as_str() {
+    let level = match std::env::var("TOR_LOG")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
         "error" => ERROR,
         "warn" | "warning" => WARN,
         "" | "info" => INFO,

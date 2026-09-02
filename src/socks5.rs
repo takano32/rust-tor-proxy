@@ -165,9 +165,7 @@ fn reply_code(error: &io::Error) -> u8 {
     {
         return match end.0 {
             circuit::END_REASON_EXITPOLICY => REP_NOT_ALLOWED,
-            circuit::END_REASON_RESOLVEFAILED | circuit::END_REASON_NOROUTE => {
-                REP_HOST_UNREACHABLE
-            }
+            circuit::END_REASON_RESOLVEFAILED | circuit::END_REASON_NOROUTE => REP_HOST_UNREACHABLE,
             circuit::END_REASON_CONNECTREFUSED => REP_CONNECTION_REFUSED,
             circuit::END_REASON_TIMEOUT => REP_TTL_EXPIRED,
             _ => REP_GENERAL_FAILURE,
@@ -221,7 +219,9 @@ mod tests {
 
     #[test]
     fn accepts_an_ipv4_connect() {
-        let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, ATYP_IPV4, 93, 184, 216, 34];
+        let mut request = vec![
+            0x05, 0x01, 0x00, 0x05, 0x01, 0x00, ATYP_IPV4, 93, 184, 216, 34,
+        ];
         request.extend_from_slice(&80u16.to_be_bytes());
         let (parsed, _) = negotiate_with(&request);
         let parsed = parsed.expect("should parse");
@@ -242,7 +242,9 @@ mod tests {
 
     #[test]
     fn rejects_bind_and_associate() {
-        let request = vec![0x05, 0x01, 0x00, 0x05, 0x02, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80];
+        let request = vec![
+            0x05, 0x01, 0x00, 0x05, 0x02, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80,
+        ];
         let (parsed, written) = negotiate_with(&request);
         assert!(parsed.is_err());
         assert_eq!(written[2..4], [0x05, REP_COMMAND_NOT_SUPPORTED]);

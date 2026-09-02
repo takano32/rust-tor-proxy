@@ -39,13 +39,11 @@ mod tests {
     fn rfc4231_vectors() {
         assert_eq!(
             hmac_sha256(&[0x0b; 20], b"Hi There").to_vec(),
-            hex_decode("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
-                .unwrap()
+            hex_decode("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7").unwrap()
         );
         assert_eq!(
             hmac_sha256(b"Jefe", b"what do ya want for nothing?").to_vec(),
-            hex_decode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
-                .unwrap()
+            hex_decode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843").unwrap()
         );
     }
 }

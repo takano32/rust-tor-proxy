@@ -100,10 +100,6 @@ pub fn guard_candidates(consensus: &Consensus) -> Vec<&RouterStatus> {
         .collect()
 }
 
-pub fn pick_guard(consensus: &Consensus) -> io::Result<&RouterStatus> {
-    weighted_choice(&guard_candidates(consensus))
-}
-
 /// Candidate exits, before their port policy is known.
 ///
 /// The microdescriptor holds the policy, so the caller samples from here,
@@ -136,7 +132,10 @@ pub fn middle_candidates<'a>(
 }
 
 /// Draw `count` distinct relays without replacement, weighted by bandwidth.
-pub fn sample<'a>(candidates: &[&'a RouterStatus], count: usize) -> io::Result<Vec<&'a RouterStatus>> {
+pub fn sample<'a>(
+    candidates: &[&'a RouterStatus],
+    count: usize,
+) -> io::Result<Vec<&'a RouterStatus>> {
     let mut pool: Vec<&RouterStatus> = candidates.to_vec();
     let mut out = Vec::with_capacity(count.min(pool.len()));
     while out.len() < count && !pool.is_empty() {
@@ -235,10 +234,7 @@ mod tests {
         assert!(!constraints.accepts(&b, Some(&b_md)));
         // A relay whose family names nobody in the path is still fine.
         let unrelated = md_with_family(vec![[8u8; 20]]);
-        assert!(constraints.accepts(
-            &router(9, [90, 1, 1, 1], GUARD_FLAGS, 1),
-            Some(&unrelated)
-        ));
+        assert!(constraints.accepts(&router(9, [90, 1, 1, 1], GUARD_FLAGS, 1), Some(&unrelated)));
     }
 
     fn md_with_family(family: Vec<[u8; 20]>) -> Microdesc {
@@ -264,7 +260,10 @@ mod tests {
                 heavy_hits += 1;
             }
         }
-        assert!(heavy_hits > 180, "heavy relay chosen {heavy_hits}/200 times");
+        assert!(
+            heavy_hits > 180,
+            "heavy relay chosen {heavy_hits}/200 times"
+        );
 
         let zero = router(3, [3, 3, 3, 3], GUARD_FLAGS, 0);
         let only_zero = vec![&zero];

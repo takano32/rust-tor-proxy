@@ -6,7 +6,11 @@ use std::{
 
 /// Copy bytes both ways between a SOCKS5 client and a Tor stream until either
 /// side reaches EOF.
-pub fn bidirectional<R, W>(mut client: TcpStream, mut tor_read: R, mut tor_write: W) -> io::Result<()>
+pub fn bidirectional<R, W>(
+    mut client: TcpStream,
+    mut tor_read: R,
+    mut tor_write: W,
+) -> io::Result<()>
 where
     R: Read,
     W: Write + Send + 'static,

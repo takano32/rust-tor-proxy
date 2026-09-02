@@ -24,7 +24,6 @@ pub mod tls;
 pub mod x25519;
 
 pub const SSL_VERIFY_NONE: c_int = 0;
-pub const SSL_ERROR_NONE: c_int = 0;
 pub const SSL_ERROR_WANT_READ: c_int = 2;
 pub const SSL_ERROR_WANT_WRITE: c_int = 3;
 pub const SSL_ERROR_ZERO_RETURN: c_int = 6;
@@ -75,7 +74,11 @@ extern "C" {
     ) -> c_int;
     pub fn EVP_MD_CTX_new() -> *mut c_void;
     pub fn EVP_MD_CTX_free(ctx: *mut c_void);
-    pub fn EVP_DigestInit_ex(ctx: *mut c_void, md_type: *const c_void, engine: *mut c_void) -> c_int;
+    pub fn EVP_DigestInit_ex(
+        ctx: *mut c_void,
+        md_type: *const c_void,
+        engine: *mut c_void,
+    ) -> c_int;
     pub fn EVP_DigestUpdate(ctx: *mut c_void, data: *const c_void, count: usize) -> c_int;
     pub fn EVP_DigestFinal_ex(ctx: *mut c_void, md: *mut c_uchar, size: *mut c_uint) -> c_int;
     pub fn EVP_MD_CTX_copy_ex(out: *mut c_void, inp: *const c_void) -> c_int;
@@ -207,7 +210,13 @@ pub fn openssl_errors() -> String {
         let bytes: Vec<u8> = buf
             .iter()
             .take_while(|&&b| b != 0)
-            .map(|&b| b as u8)
+            // No-op where c_char is already unsigned; needed where it is not.
+            .map(|&b| {
+                #[allow(clippy::unnecessary_cast)]
+                {
+                    b as u8
+                }
+            })
             .collect();
         if !out.is_empty() {
             out.push_str("; ");

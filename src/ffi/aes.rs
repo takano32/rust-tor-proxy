@@ -45,9 +45,7 @@ impl Aes128Ctr {
         }
         let mut out_len: c_int = 0;
         let ptr = buf.as_mut_ptr();
-        let rc = unsafe {
-            EVP_EncryptUpdate(self.ctx, ptr, &mut out_len, ptr, buf.len() as c_int)
-        };
+        let rc = unsafe { EVP_EncryptUpdate(self.ctx, ptr, &mut out_len, ptr, buf.len() as c_int) };
         assert_eq!(rc, 1, "EVP_EncryptUpdate failed: {}", openssl_errors());
         assert_eq!(out_len as usize, buf.len());
     }

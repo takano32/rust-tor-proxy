@@ -12,7 +12,6 @@ use std::io;
 use super::hash;
 use super::x25519::CtxGuard;
 use super::*;
-use crate::util;
 
 pub struct RsaPublicKey {
     pkey: *mut c_void,
@@ -44,12 +43,6 @@ impl RsaPublicKey {
             pkey,
             der: der.to_vec(),
         })
-    }
-
-    /// Parse a `-----BEGIN RSA PUBLIC KEY-----` block.
-    pub fn from_pem(pem: &str) -> io::Result<Self> {
-        let body = util::pem_body(pem, "RSA PUBLIC KEY")?;
-        Self::from_pkcs1_der(&util::base64_decode(body)?)
     }
 
     /// SHA-1 of the DER encoding: the 20-byte Tor identity fingerprint.
@@ -131,9 +124,18 @@ oHltVbhZfTwL/JUXV2YL1QF/Pazknmy+aGHYI/Bidt88Vtk+JPbfoTaOD1rsAy18
         "da65633eba292893e0d57d74e633ea66085dcc9dee5ec46a3ec6e8ce5049b074"
     );
 
+    /// The DER between the PEM banner lines.
+    fn public_key_der() -> Vec<u8> {
+        let body: String = PUBLIC_KEY_PEM
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        crate::util::base64_decode(&body).unwrap()
+    }
+
     #[test]
     fn verifies_tor_style_signature() {
-        let key = RsaPublicKey::from_pem(PUBLIC_KEY_PEM).unwrap();
+        let key = RsaPublicKey::from_pkcs1_der(&public_key_der()).unwrap();
         let sig = hex_decode(SIGNATURE_HEX).unwrap();
         let digest = hash::sha1(b"tor directory signature test");
 
@@ -148,11 +150,8 @@ oHltVbhZfTwL/JUXV2YL1QF/Pazknmy+aGHYI/Bidt88Vtk+JPbfoTaOD1rsAy18
 
     #[test]
     fn fingerprint_is_sha1_of_der() {
-        let key = RsaPublicKey::from_pem(PUBLIC_KEY_PEM).unwrap();
-        let der = crate::util::base64_decode(
-            crate::util::pem_body(PUBLIC_KEY_PEM, "RSA PUBLIC KEY").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(key.fingerprint().to_vec(), hash::sha1(&der).to_vec());
+        let der = public_key_der();
+        let key = RsaPublicKey::from_pkcs1_der(&der).unwrap();
+        assert_eq!(key.fingerprint(), hash::sha1(&der));
     }
 }

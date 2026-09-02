@@ -33,71 +33,41 @@ fn digest_into(md: *const c_void, data: &[u8], out: &mut [u8]) {
     assert_eq!(len as usize, out.len());
 }
 
-/// Which hash a [`Digest`] computes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Algorithm {
-    Sha1,
-    Sha256,
-}
-
-impl Algorithm {
-    pub fn output_len(self) -> usize {
-        match self {
-            Algorithm::Sha1 => 20,
-            Algorithm::Sha256 => 32,
-        }
-    }
-
-    fn md(self) -> *const c_void {
-        unsafe {
-            match self {
-                Algorithm::Sha1 => EVP_sha1(),
-                Algorithm::Sha256 => EVP_sha256(),
-            }
-        }
-    }
-}
-
-/// A running digest whose intermediate value can be read without ending it.
+/// A running SHA-1 digest whose intermediate value can be read without ending
+/// it.
 ///
 /// Tor's relay-cell integrity check needs exactly that: every cell's digest is
 /// the running hash of every relay cell sent so far on the circuit. `peek`
 /// finalises a *copy* of the context, so the original keeps accumulating.
 pub struct Digest {
     ctx: *mut c_void,
-    alg: Algorithm,
 }
 
 // The context is owned exclusively by this value.
 unsafe impl Send for Digest {}
 
 impl Digest {
-    pub fn new(alg: Algorithm) -> Self {
+    pub fn sha1() -> Self {
         let ctx = unsafe { EVP_MD_CTX_new() };
         assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
-        let rc = unsafe { EVP_DigestInit_ex(ctx, alg.md(), std::ptr::null_mut()) };
+        let rc = unsafe { EVP_DigestInit_ex(ctx, EVP_sha1(), std::ptr::null_mut()) };
         assert_eq!(rc, 1, "EVP_DigestInit_ex failed: {}", openssl_errors());
-        Self { ctx, alg }
-    }
-
-    pub fn sha1() -> Self {
-        Self::new(Algorithm::Sha1)
+        Self { ctx }
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        let rc =
-            unsafe { EVP_DigestUpdate(self.ctx, data.as_ptr() as *const c_void, data.len()) };
+        let rc = unsafe { EVP_DigestUpdate(self.ctx, data.as_ptr() as *const c_void, data.len()) };
         assert_eq!(rc, 1, "EVP_DigestUpdate failed: {}", openssl_errors());
     }
 
     /// The digest value as of right now; the running state is unchanged.
-    pub fn peek(&self) -> Vec<u8> {
+    pub fn peek(&self) -> [u8; 20] {
         let copy = self.clone();
-        let mut out = vec![0u8; self.alg.output_len()];
+        let mut out = [0u8; 20];
         let mut len: c_uint = 0;
         let rc = unsafe { EVP_DigestFinal_ex(copy.ctx, out.as_mut_ptr(), &mut len) };
         assert_eq!(rc, 1, "EVP_DigestFinal_ex failed: {}", openssl_errors());
-        out.truncate(len as usize);
+        assert_eq!(len as usize, out.len());
         out
     }
 
@@ -116,10 +86,7 @@ impl Clone for Digest {
         assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
         let rc = unsafe { EVP_MD_CTX_copy_ex(ctx, self.ctx) };
         assert_eq!(rc, 1, "EVP_MD_CTX_copy_ex failed: {}", openssl_errors());
-        Self {
-            ctx,
-            alg: self.alg,
-        }
+        Self { ctx }
     }
 }
 
@@ -127,17 +94,6 @@ impl Drop for Digest {
     fn drop(&mut self) {
         unsafe { EVP_MD_CTX_free(self.ctx) };
     }
-}
-
-/// SHA-256 over several pieces without concatenating them first.
-pub fn sha256_of_parts(parts: &[&[u8]]) -> [u8; 32] {
-    let mut d = Digest::new(Algorithm::Sha256);
-    for p in parts {
-        d.update(p);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&d.peek());
-    out
 }
 
 #[cfg(test)]
@@ -149,8 +105,7 @@ mod tests {
     fn known_digests() {
         assert_eq!(
             sha256(b"abc").to_vec(),
-            hex_decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
-                .unwrap()
+            hex_decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap()
         );
         assert_eq!(
             sha1(b"abc").to_vec(),
@@ -158,8 +113,7 @@ mod tests {
         );
         assert_eq!(
             sha256(b"").to_vec(),
-            hex_decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-                .unwrap()
+            hex_decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap()
         );
     }
 
@@ -170,13 +124,13 @@ mod tests {
         let mut d = Digest::sha1();
         d.update(b"a");
         d.update(b"b");
-        assert_eq!(d.peek(), sha1(b"ab").to_vec());
+        assert_eq!(d.peek(), sha1(b"ab"));
 
         let mut branch = d.clone();
         branch.update(b"X");
         d.update(b"c");
-        assert_eq!(branch.peek(), sha1(b"abX").to_vec());
-        assert_eq!(d.peek(), sha1(b"abc").to_vec());
+        assert_eq!(branch.peek(), sha1(b"abX"));
+        assert_eq!(d.peek(), sha1(b"abc"));
         assert_eq!(d.peek_prefix::<4>(), sha1(b"abc")[..4]);
     }
 }

@@ -173,19 +173,6 @@ pub fn be_u16(buf: &[u8], offset: usize) -> io::Result<u16> {
     Ok(u16::from_be_bytes([buf[offset], buf[offset + 1]]))
 }
 
-/// Read a big-endian u32 at `offset`, or fail.
-pub fn be_u32(buf: &[u8], offset: usize) -> io::Result<u32> {
-    if offset + 4 > buf.len() {
-        return Err(invalid_data("truncated u32"));
-    }
-    Ok(u32::from_be_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-    ]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

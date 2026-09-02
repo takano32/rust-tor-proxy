@@ -58,7 +58,10 @@ impl PortPolicy {
     }
 
     pub fn allows(&self, port: u16) -> bool {
-        let listed = self.ranges.iter().any(|(low, high)| (*low..=*high).contains(&port));
+        let listed = self
+            .ranges
+            .iter()
+            .any(|(low, high)| (*low..=*high).contains(&port));
         listed == self.is_accept
     }
 
@@ -83,7 +86,9 @@ impl Microdesc {
     /// Parse one microdescriptor, given its exact text.
     pub fn parse(text: &str) -> io::Result<Self> {
         if !text.starts_with("onion-key") {
-            return Err(invalid_data("microdescriptor does not start with onion-key"));
+            return Err(invalid_data(
+                "microdescriptor does not start with onion-key",
+            ));
         }
         let ntor = netdoc::item(text, "ntor-onion-key")
             .ok_or_else(|| invalid_data("microdescriptor has no ntor-onion-key"))?;
@@ -142,7 +147,11 @@ pub fn parse_batch(text: &str) -> Vec<(&str, Microdesc)> {
         let absolute = offset + relative;
         starts.push(absolute);
         // Step past this line so the next search finds the following entry.
-        offset = absolute + text[absolute..].find('\n').map(|i| i + 1).unwrap_or(text.len() - absolute);
+        offset = absolute
+            + text[absolute..]
+                .find('\n')
+                .map(|i| i + 1)
+                .unwrap_or(text.len() - absolute);
         if offset >= text.len() {
             break;
         }
@@ -196,9 +205,8 @@ mod tests {
         assert!(!md.exit_policy.is_empty());
 
         // No p line at all means the relay exits nowhere.
-        let text = "onion-key\nntor-onion-key ".to_string()
-            + &base64_encode_unpadded(&[2u8; 32])
-            + "\n";
+        let text =
+            "onion-key\nntor-onion-key ".to_string() + &base64_encode_unpadded(&[2u8; 32]) + "\n";
         let md = Microdesc::parse(&text).unwrap();
         assert!(!md.exit_policy.allows(80));
         assert!(md.exit_policy.is_empty());

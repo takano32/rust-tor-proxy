@@ -210,22 +210,3 @@ impl Drop for SslStream {
         }
     }
 }
-
-/// Wait until `fd` is ready, or `timeout` elapses. Returns the ready events.
-pub fn wait_ready(fd: RawFd, for_write: bool, timeout: Duration) -> io::Result<i16> {
-    let mut pfd = PollFd {
-        fd,
-        events: if for_write { POLLOUT } else { POLLIN },
-        revents: 0,
-    };
-    let millis = timeout.as_millis().min(c_int::MAX as u128) as c_int;
-    let rc = unsafe { poll(&mut pfd, 1, millis) };
-    if rc < 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
-            return Ok(0);
-        }
-        return Err(err);
-    }
-    Ok(pfd.revents)
-}

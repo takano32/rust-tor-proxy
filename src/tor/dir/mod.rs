@@ -36,10 +36,14 @@ const MICRODESCS_PER_REQUEST: usize = 92;
 pub struct DirCircuit {
     channel: Channel,
     circuit: Circuit,
+    /// False when the channel belongs to someone else (the guard), in which
+    /// case closing this must not close the channel.
+    owns_channel: bool,
 }
 
 impl DirCircuit {
-    /// Try random fallback mirrors until one accepts a circuit.
+    /// Try random fallback mirrors until one accepts a circuit, then fall
+    /// back to the directory authorities themselves.
     pub fn to_random_fallback() -> io::Result<Self> {
         let dirs = fallback::FALLBACK_DIRS;
         let mut last: Option<io::Error> = None;
@@ -55,7 +59,24 @@ impl DirCircuit {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| io::Error::other("no fallback directory answered")))
+
+        // The authorities are a last resort: they are few, so leaning on them
+        // is both slow for us and rude to them.
+        crate::warn!("no fallback mirror answered; trying the authorities");
+        for auth in authority::AUTHORITIES {
+            let addr = SocketAddrV4::new(Ipv4Addr::from(auth.ipv4), auth.or_port);
+            match Self::to(addr) {
+                Ok(dir) => {
+                    crate::info!("using directory authority {}", auth.nickname);
+                    return Ok(dir);
+                }
+                Err(e) => {
+                    crate::debug!("authority {} ({addr}): {e}", auth.nickname);
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("no directory server answered")))
     }
 
     pub fn to(addr: SocketAddrV4) -> io::Result<Self> {
@@ -67,7 +88,22 @@ impl DirCircuit {
                 return Err(e);
             }
         };
-        Ok(Self { channel, circuit })
+        Ok(Self {
+            channel,
+            circuit,
+            owns_channel: true,
+        })
+    }
+
+    /// A directory circuit on a channel that is already open, so that a
+    /// directory fetch through the guard does not need a second connection.
+    pub fn on(channel: Channel) -> io::Result<Self> {
+        let circuit = Circuit::create_fast(&channel)?;
+        Ok(Self {
+            channel,
+            circuit,
+            owns_channel: false,
+        })
     }
 
     pub fn get(&self, path: &str) -> io::Result<Vec<u8>> {
@@ -80,7 +116,9 @@ impl DirCircuit {
 
     pub fn close(self) {
         self.circuit.close();
-        self.channel.close();
+        if self.owns_channel {
+            self.channel.close();
+        }
     }
 }
 
@@ -96,10 +134,7 @@ impl Directory {
     pub fn bootstrap(cache: Cache) -> io::Result<Self> {
         let now = now_unix();
         if let Some(directory) = Self::from_cache(&cache, now) {
-            crate::info!(
-                "using cached consensus, valid until {}",
-                crate::util::format_datetime(directory.consensus.valid_until)
-            );
+            crate::info!("using cached consensus: {}", directory.summary());
             return Ok(directory);
         }
 
@@ -107,6 +142,9 @@ impl Directory {
         crate::info!("fetching consensus from {}", dir_circuit.peer());
         let result = Self::fetch(&cache, &dir_circuit, now);
         dir_circuit.close();
+        if let Ok(directory) = &result {
+            crate::info!("consensus verified: {}", directory.summary());
+        }
         result
     }
 
@@ -118,6 +156,10 @@ impl Directory {
             consensus::parse_and_verify(&String::from_utf8_lossy(&consensus_raw), &certs, now)
                 .map_err(|e| crate::debug!("cached consensus unusable: {e}"))
                 .ok()?;
+        if !consensus.is_live(now) {
+            crate::debug!("cached consensus is no longer valid");
+            return None;
+        }
         Some(Self {
             consensus,
             certs,
@@ -167,6 +209,23 @@ impl Directory {
 
     pub fn certificate_count(&self) -> usize {
         self.certs.len()
+    }
+
+    /// A one-line description for the startup log.
+    pub fn summary(&self) -> String {
+        use consensus::{FLAG_EXIT, FLAG_GUARD, FLAG_RUNNING, FLAG_VALID};
+        let c = &self.consensus;
+        format!(
+            "{} relays ({} guards, {} exits), {} authority certificates, \
+             valid-after {}, fresh-until {}, valid-until {}",
+            c.routers.len(),
+            c.count_with(FLAG_GUARD | FLAG_RUNNING | FLAG_VALID),
+            c.count_with(FLAG_EXIT | FLAG_RUNNING | FLAG_VALID),
+            self.certificate_count(),
+            crate::util::format_datetime(c.valid_after),
+            crate::util::format_datetime(c.fresh_until),
+            crate::util::format_datetime(c.valid_until),
+        )
     }
 
     /// Fetch the microdescriptors for `digests`, using the cache where
@@ -277,7 +336,9 @@ mod live_tests {
             .map(|r| r.microdesc_digest)
             .collect();
         let dir_circuit = DirCircuit::to_random_fallback().expect("dir circuit");
-        let mds = directory.microdescs(&wanted, &dir_circuit).expect("microdescs");
+        let mds = directory
+            .microdescs(&wanted, &dir_circuit)
+            .expect("microdescs");
         dir_circuit.close();
         println!("fetched {} of {} microdescriptors", mds.len(), wanted.len());
         assert!(!mds.is_empty());

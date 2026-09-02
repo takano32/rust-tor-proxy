@@ -22,6 +22,10 @@ use crate::util::invalid_data;
 pub const CERT_TYPE_IDENTITY_V_SIGNING: u8 = 4;
 pub const CERT_TYPE_SIGNING_V_TLS: u8 = 5;
 
+/// CERT_KEY_TYPE values (cert-spec.md, "List of certified key types").
+const KEY_TYPE_ED25519: u8 = 1;
+const KEY_TYPE_SHA256_OF_X509: u8 = 3;
+
 const EXT_TYPE_SIGNED_WITH_ED25519: u8 = 4;
 const EXT_FLAG_AFFECTS_VALIDATION: u8 = 1;
 
@@ -191,20 +195,36 @@ pub fn validate_responder(
     if id_cert.cert_type != CERT_TYPE_IDENTITY_V_SIGNING {
         return Err(invalid_data("type 4 certificate has the wrong CERT_TYPE"));
     }
+    if id_cert.cert_key_type != KEY_TYPE_ED25519 {
+        return Err(invalid_data(
+            "type 4 certificate does not certify an Ed25519 key",
+        ));
+    }
     let identity = id_cert
         .signing_key
         .ok_or_else(|| invalid_data("type 4 certificate has no signed-with-ed25519-key"))?;
     if !id_cert.check_signature(&identity) {
-        return Err(invalid_data("type 4 certificate is not correctly self-signed"));
+        return Err(invalid_data(
+            "type 4 certificate is not correctly self-signed",
+        ));
     }
     if id_cert.is_expired(now_unix) {
-        return Err(expired("type 4 certificate", id_cert.expires_at_unix(), now_unix));
+        return Err(expired(
+            "type 4 certificate",
+            id_cert.expires_at_unix(),
+            now_unix,
+        ));
     }
     let signing_key = id_cert.certified_key;
 
     let tls_cert = Ed25519Cert::parse(certs.unique(CERT_TYPE_SIGNING_V_TLS)?)?;
     if tls_cert.cert_type != CERT_TYPE_SIGNING_V_TLS {
         return Err(invalid_data("type 5 certificate has the wrong CERT_TYPE"));
+    }
+    if tls_cert.cert_key_type != KEY_TYPE_SHA256_OF_X509 {
+        return Err(invalid_data(
+            "type 5 certificate does not certify an X.509 digest",
+        ));
     }
     if !tls_cert.check_signature(&signing_key) {
         return Err(invalid_data(

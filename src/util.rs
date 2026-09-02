@@ -3,8 +3,7 @@
 
 use std::io;
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_value(c: u8) -> Option<u8> {
     match c {
@@ -28,8 +27,9 @@ pub fn base64_decode(input: &str) -> io::Result<Vec<u8>> {
             b' ' | b'\t' | b'\r' | b'\n' => continue,
             _ => {}
         }
-        let v = b64_value(c)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid base64 character"))?;
+        let v = b64_value(c).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid base64 character")
+        })?;
         acc = (acc << 6) | v as u32;
         bits += 6;
         if bits >= 8 {
@@ -78,7 +78,7 @@ pub fn hex_encode(data: &[u8]) -> String {
 
 pub fn hex_decode(s: &str) -> io::Result<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "odd-length hex string",
@@ -99,21 +99,6 @@ pub fn hex_decode(s: &str) -> io::Result<Vec<u8>> {
         .chunks(2)
         .map(|p| Ok((nibble(p[0])? << 4) | nibble(p[1])?))
         .collect()
-}
-
-/// Pull the body out of a PEM block with the given label.
-pub fn pem_body<'a>(text: &'a str, label: &str) -> io::Result<&'a str> {
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
-    let start = text
-        .find(&begin)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {begin}")))?
-        + begin.len();
-    let rest = &text[start..];
-    let stop = rest
-        .find(&end)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {end}")))?;
-    Ok(&rest[..stop])
 }
 
 pub fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(msg: E) -> io::Error {
@@ -151,8 +136,7 @@ pub fn parse_datetime(date: &str, time: &str) -> io::Result<u64> {
     if t.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return Err(bad());
     }
-    let seconds =
-        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
     u64::try_from(seconds).map_err(|_| bad())
 }
 
@@ -204,8 +188,14 @@ mod tests {
     #[test]
     fn datetime_round_trip() {
         assert_eq!(parse_datetime("1970-01-01", "00:00:00").unwrap(), 0);
-        assert_eq!(parse_datetime("2000-03-01", "00:00:00").unwrap(), 951_868_800);
-        assert_eq!(parse_datetime("2026-09-02", "12:34:56").unwrap(), 1_788_352_496);
+        assert_eq!(
+            parse_datetime("2000-03-01", "00:00:00").unwrap(),
+            951_868_800
+        );
+        assert_eq!(
+            parse_datetime("2026-09-02", "12:34:56").unwrap(),
+            1_788_352_496
+        );
         // A leap day must land where the Gregorian calendar puts it.
         assert_eq!(
             parse_datetime("2024-02-29", "00:00:00").unwrap() + 86_400,
@@ -226,7 +216,10 @@ mod tests {
     #[test]
     fn hex_round_trip() {
         assert_eq!(hex_encode(&[0x00, 0x0f, 0xa5, 0xff]), "000FA5FF");
-        assert_eq!(hex_decode("000fA5ff").unwrap(), vec![0x00, 0x0f, 0xa5, 0xff]);
+        assert_eq!(
+            hex_decode("000fA5ff").unwrap(),
+            vec![0x00, 0x0f, 0xa5, 0xff]
+        );
         assert!(hex_decode("abc").is_err());
         assert!(hex_decode("zz").is_err());
     }

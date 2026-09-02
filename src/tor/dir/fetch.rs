@@ -5,8 +5,8 @@
 //! compression is requested: adding zlib would mean another FFI surface, and
 //! the only large document is the consensus.
 
-use std::io::{Read, Write};
 use std::io::{self};
+use std::io::{Read, Write};
 
 use crate::tor::circuit::Circuit;
 use crate::util::invalid_data;

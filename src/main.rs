@@ -20,7 +20,10 @@ fn main() -> std::io::Result<()> {
     // Bind before bootstrapping, so a port conflict is reported immediately
     // rather than after a minute of directory work.
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port))?;
-    info!("bootstrapping the Tor client (state in {})", config.state_dir.display());
+    info!(
+        "bootstrapping the Tor client (state in {})",
+        config.state_dir.display()
+    );
 
     let client = Arc::new(tor::client::TorClient::bootstrap(config.state_dir)?);
     info!("ready: {}", client.consensus_summary());
