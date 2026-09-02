@@ -11,11 +11,31 @@ mod tor;
 mod util;
 
 use std::net::TcpListener;
+use std::process::ExitCode;
 use std::sync::Arc;
 
-fn main() -> std::io::Result<()> {
+fn main() -> ExitCode {
     log::init();
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Returning io::Error from main would print its Debug form, which
+            // buries the message in Custom { kind: Other, error: "..." }.
+            error!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> std::io::Result<()> {
     let config = config::Config::from_env()?;
+
+    // OpenSSL is resolved at run time, so surface a missing library here
+    // rather than from whichever thread happens to need crypto first.
+    ffi::ensure_loaded()?;
+    if let Some((ssl, crypto)) = ffi::library_paths() {
+        debug!("OpenSSL loaded from {ssl} and {crypto}");
+    }
 
     // Bind before bootstrapping, so a port conflict is reported immediately
     // rather than after a minute of directory work.

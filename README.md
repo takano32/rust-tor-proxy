@@ -13,12 +13,27 @@ building `arti` is not possible at all.
 
 - Linux, Rust stable (verified with 1.96)
 - OpenSSL **3.x** shared libraries: `libssl.so.3` and `libcrypto.so.3`.
-  Headers are not needed. Check with:
+  **No headers and no `-dev`/`-devel` package are needed**, at build time or at
+  run time. Check with:
   ```sh
-  ldconfig -p | grep -E 'libssl|libcrypto'
+  ldconfig -p | grep -E 'libssl|libcrypto'   # or: find / -name 'libssl.so*' 2>/dev/null
   ```
   The 1.1 series is not supported: `SSL_get1_peer_certificate` and
-  `EVP_PKEY_CTX_set_rsa_padding` are a 3.0 name and a 3.0 function.
+  `EVP_PKEY_CTX_set_rsa_padding` are a 3.0 name and a 3.0 function. If only 1.1
+  is present the program says so by name at start-up.
+
+OpenSSL is loaded with `dlopen` when the process starts, not linked at build
+time, so the binary records no `DT_NEEDED` entry for it and the file name and
+directory may both vary. If it lives somewhere the dynamic loader does not
+look:
+
+| Variable | Meaning |
+|---|---|
+| `TOR_OPENSSL_DIR` | Directory holding the libraries, whatever they are named. |
+| `TOR_LIBSSL` / `TOR_LIBCRYPTO` | Exact paths, when even the names differ. |
+
+A setting that cannot be loaded produces a warning and the normal search
+continues, so a stale value from another machine is not fatal.
 
 ## Run
 

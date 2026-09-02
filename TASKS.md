@@ -375,6 +375,15 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 2. **`OPENSSL_free` は使えない**。OpenSSL 3 ではマクロであってエクスポートされた
    シンボルではない。`i2d_X509(x, NULL)` で長さを得てから自前バッファに書く方式にした。
    `SSL_set_tlsext_host_name` も同様にマクロなので SNI は送らない(リレーは要求しない)。
+2a. **OpenSSL はリンク時ではなく実行時に `dlopen` で読み込む**(2026-09-02 追加)。
+   `#[link(name = "ssl")]` はリンカに `libssl.so` を探させるが、これは `-dev`
+   パッケージだけが入れるバージョンなしのシンボリックリンクで、配備先のコンテナには
+   `libssl.so.3` しか無く `unable to find library -lssl` で失敗した。§0.3 の前提
+   (「`.so.3` があればよい」)を満たすため、全エントリポイントを `dlsym` で解決する
+   方式に変更した。バイナリの `DT_NEEDED` から OpenSSL が消える。
+   探索順は `TOR_LIBSSL`/`TOR_LIBCRYPTO` → `TOR_OPENSSL_DIR` → soname →
+   よくあるライブラリディレクトリ。マクロ 1 つから「関数ポインタの構造体・解決処理・
+   同名同シグネチャの呼び出しラッパ」を生成しているので、呼び出し側は無変更。
 3. **チャネルの I/O は poll(2) 駆動の単一スレッド**にした。計画の
    「reader スレッド + `Mutex<SslStream>`」だと 1 つの `SSL` オブジェクトを
    読み書き 2 スレッドから同時に触ることになり、OpenSSL はそれを保証しない。
