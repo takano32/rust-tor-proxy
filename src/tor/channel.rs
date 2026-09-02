@@ -27,7 +27,6 @@ use crate::ffi::rand;
 use crate::ffi::tls::SslStream;
 use crate::ffi::{poll, PollFd, POLLIN, POLLOUT};
 use crate::util::invalid_data;
-use crate::{debug, log_at, trace, warn};
 
 /// Link protocol versions we are willing to speak. v5 is left out on purpose:
 /// it turns on padding negotiation, which we do not implement.
