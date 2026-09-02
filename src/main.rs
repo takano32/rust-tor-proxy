@@ -4,6 +4,7 @@ mod log;
 mod config;
 mod ffi;
 mod relay;
+mod tor;
 mod util;
 
 fn main() -> std::io::Result<()> {

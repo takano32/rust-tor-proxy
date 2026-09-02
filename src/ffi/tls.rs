@@ -5,10 +5,10 @@
 //! by the CERTS cell, which binds the certificate's SHA-256 to the relay's
 //! Ed25519 identity. That digest is captured here right after the handshake.
 //!
-//! The handshake runs on a blocking socket with a timeout; afterwards the
-//! socket is switched to non-blocking so that a single I/O thread can drive
-//! reads and writes with `poll(2)` without ever using the `SSL` object from
-//! two threads at once.
+//! The handshake and the Tor link handshake that follows run on a blocking
+//! socket with a timeout. `set_nonblocking` then hands the stream to a single
+//! `poll(2)`-driven I/O thread, so the `SSL` object is never used from two
+//! threads at once.
 
 use std::ffi::{c_int, c_void};
 use std::io::{self, Read, Write};
@@ -95,11 +95,15 @@ impl SslStream {
         }
 
         stream.peer_cert_sha256 = stream.read_peer_cert_digest()?;
-
-        stream.sock.set_read_timeout(None)?;
-        stream.sock.set_write_timeout(None)?;
-        stream.sock.set_nonblocking(true)?;
         Ok(stream)
+    }
+
+    /// Hand the stream over to the poll-driven I/O loop: no socket timeouts,
+    /// and `WouldBlock` instead of blocking.
+    pub fn set_nonblocking(&mut self) -> io::Result<()> {
+        self.sock.set_read_timeout(None)?;
+        self.sock.set_write_timeout(None)?;
+        self.sock.set_nonblocking(true)
     }
 
     fn read_peer_cert_digest(&self) -> io::Result<[u8; 32]> {
