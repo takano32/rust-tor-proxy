@@ -13,15 +13,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::certs::now_unix;
 use super::channel::Channel;
 use super::circuit::{Circuit, TorStream};
 use super::dir::cache::Cache;
-use super::dir::consensus::RouterStatus;
+use super::dir::consensus::{Consensus, RouterStatus, FLAG_HSDIR};
 use super::dir::microdesc::Microdesc;
 use super::dir::{DirCircuit, Directory};
+use super::hs::address::OnionAddress;
+use super::hs::blind::TimePeriod;
+use super::hs::descriptor::{self, Descriptor};
+use super::hs::hsdir::{self, RingNode};
 use super::path::{self, PathConstraints};
 use super::RelayInfo;
-use crate::util::{hex_decode, hex_encode, invalid_data};
+use crate::ffi::rand;
+use crate::util::{base64_encode_unpadded, hex_decode, hex_encode, invalid_data};
 
 /// Retire a circuit this long after it was built.
 const MAX_CIRCUIT_AGE: Duration = Duration::from_secs(600);
@@ -40,6 +46,11 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// still be unreachable from here.
 const GUARD_ATTEMPTS: usize = 5;
 
+/// How many of the responsible directory nodes to ask for a descriptor before
+/// giving up -- unless every one of them answered "not here", in which case
+/// the rest are worth trying too (rend-spec's time-period boundary case).
+const HSDIR_TRIES: usize = 3;
+
 const GUARD_FILE: &str = "guard";
 
 pub struct TorClient {
@@ -50,6 +61,32 @@ pub struct TorClient {
     failed_guards: Mutex<Vec<[u8; 20]>>,
     circuits: Mutex<Vec<PooledCircuit>>,
     microdescs: Mutex<HashMap<[u8; 32], Arc<Microdesc>>>,
+    /// Built the first time a `.onion` address is asked for, because it costs
+    /// thousands of microdescriptors that a client with no onion traffic
+    /// never needs.
+    hsdir_ring: Mutex<Option<Arc<HsdirRing>>>,
+    /// Onion service descriptors, in memory only: they name the service's
+    /// introduction points, which is not something to leave on disk.
+    descriptors: Mutex<HashMap<[u8; 32], CachedDescriptor>>,
+}
+
+struct CachedDescriptor {
+    descriptor: Arc<Descriptor>,
+    /// The time period it was fetched for; a new period means a new blinded
+    /// key, so the old descriptor is not merely stale but unrelated.
+    period: u64,
+    expires_at: Instant,
+}
+
+/// The HSDir hash ring for one time period, and the period itself: the two
+/// always travel together, and both are fixed by the consensus.
+pub struct HsdirRing {
+    pub period: TimePeriod,
+    /// The consensus this was built from, so a newer one invalidates it.
+    valid_after: u64,
+    nodes: Vec<RingNode>,
+    n_replicas: u8,
+    spread_fetch: usize,
 }
 
 struct GuardState {
@@ -76,6 +113,8 @@ impl TorClient {
             failed_guards: Mutex::new(Vec::new()),
             circuits: Mutex::new(Vec::new()),
             microdescs: Mutex::new(HashMap::new()),
+            hsdir_ring: Mutex::new(None),
+            descriptors: Mutex::new(HashMap::new()),
         };
         // Open the guard channel now: an unreachable guard should be replaced
         // during startup, not on the first request.
@@ -207,24 +246,73 @@ impl TorClient {
             .cloned()
             .ok_or_else(|| invalid_data("middle microdescriptor vanished"))?;
 
-        let circuit = Circuit::create(&channel, &guard)?;
-        let build = (|| {
-            circuit.extend(&relay_info(middle, &middle_md))?;
-            circuit.extend(&relay_info(exit, &exit_md))
-        })();
-        if let Err(e) = build {
-            circuit.close();
-            return Err(e);
-        }
-        crate::debug!(
-            "circuit {} built with {} hops: {} -> {} -> {}",
-            circuit.circ_id(),
-            circuit.hop_count(),
-            guard.addr,
-            Ipv4Addr::from(middle.ipv4),
-            Ipv4Addr::from(exit.ipv4)
-        );
+        let circuit = extend_path(
+            &channel,
+            &guard,
+            &relay_info(middle, &middle_md),
+            &relay_info(exit, &exit_md),
+        )?;
         Ok((circuit, exit_md))
+    }
+
+    /// Build a three-hop circuit that ends at a relay the caller names.
+    ///
+    /// Directory, introduction and rendezvous circuits all have this shape:
+    /// the last hop is fixed by the protocol rather than chosen for its exit
+    /// policy, and only the middle is ours to pick.
+    pub fn build_circuit_to(&self, last: &RelayInfo) -> io::Result<Circuit> {
+        let (channel, guard) = self.guard_channel()?;
+        let mut constraints = PathConstraints::default();
+        self.constrain(&mut constraints, &guard);
+        self.constrain(&mut constraints, last);
+        let middle = self.choose_middle(&constraints)?;
+        extend_path(&channel, &guard, &middle, last)
+    }
+
+    /// Keep a path from doubling up on `relay`: by identity and /16 always,
+    /// and by declared family when its microdescriptor is to hand.
+    fn constrain(&self, constraints: &mut PathConstraints, relay: &RelayInfo) {
+        let md = self.cached_microdesc(&relay.rsa_identity);
+        match self.router(&relay.rsa_identity) {
+            Some(status) => constraints.add(&status, md.as_deref()),
+            // An introduction point may be named only by a descriptor, and
+            // need not appear in our consensus at all.
+            None => constraints.add_relay(
+                relay.rsa_identity,
+                [relay.addr.ip().octets()[0], relay.addr.ip().octets()[1]],
+                md.map(|m| m.family.clone()).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Draw a middle relay that fits the constraints, with its onion key.
+    fn choose_middle(&self, constraints: &PathConstraints) -> io::Result<RelayInfo> {
+        let pool = path::middle_candidates(&self.directory.consensus, constraints);
+        let sampled = path::sample(&pool, MIDDLE_SAMPLE)?;
+        let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
+        let fetched = self.load_microdescs(&wanted)?;
+        let usable: Vec<&RouterStatus> = sampled
+            .iter()
+            .copied()
+            .filter(|r| {
+                fetched
+                    .get(&r.microdesc_digest)
+                    .is_some_and(|md| constraints.accepts(r, Some(md)))
+            })
+            .collect();
+        let chosen = path::weighted_choice(&usable)?;
+        let md = fetched
+            .get(&chosen.microdesc_digest)
+            .ok_or_else(|| invalid_data("middle microdescriptor vanished"))?;
+        Ok(relay_info(chosen, md))
+    }
+
+    /// Everything needed to extend a circuit to the relay with this identity.
+    fn relay_for(&self, identity: &[u8; 20]) -> io::Result<RelayInfo> {
+        let status = self
+            .router(identity)
+            .ok_or_else(|| invalid_data("relay is not in the consensus"))?;
+        self.resolve_relay(&status)
     }
 
     /// The microdescriptor for a relay we have already fetched one for.
@@ -448,9 +536,221 @@ impl TorClient {
         DirCircuit::to_random_fallback()
     }
 
+    /// The HSDir hash ring for the current time period, building it if this
+    /// is the first `.onion` request.
+    ///
+    /// The first build fetches a microdescriptor for every HSDir in the
+    /// consensus -- some five thousand of them, in batches of 92 -- which
+    /// takes the better part of a minute. Afterwards the disk cache makes it
+    /// quick, and the ring itself is kept until the consensus changes.
+    pub fn hsdir_ring(&self) -> io::Result<Arc<HsdirRing>> {
+        let valid_after = self.directory.consensus.valid_after;
+        if let Some(ring) = self.hsdir_ring.lock().unwrap().as_ref() {
+            if ring.valid_after == valid_after {
+                return Ok(Arc::clone(ring));
+            }
+        }
+
+        let consensus = &self.directory.consensus;
+        let period = TimePeriod::containing(valid_after, consensus.params.hsdir_interval);
+        let srv = hsdir::shared_random_value(consensus, &period);
+
+        let hsdirs: Vec<&RouterStatus> = consensus
+            .routers
+            .iter()
+            .filter(|r| r.has(FLAG_HSDIR))
+            .collect();
+        crate::info!(
+            "building the HSDir ring for time period {} from {} relays",
+            period.number,
+            hsdirs.len()
+        );
+        let digests: Vec<[u8; 32]> = hsdirs.iter().map(|r| r.microdesc_digest).collect();
+
+        let dir_circuit = self.dir_circuit()?;
+        let ed_ids = self.directory.microdesc_ed_ids(&digests, &dir_circuit);
+        dir_circuit.close();
+
+        let nodes = hsdir::build_ring(
+            hsdirs
+                .iter()
+                .filter_map(|r| ed_ids.get(&r.microdesc_digest).map(|ed| (r.identity, *ed))),
+            &srv,
+            &period,
+        );
+        if nodes.is_empty() {
+            return Err(invalid_data(
+                "no HSDir in the consensus has an Ed25519 identity",
+            ));
+        }
+        crate::info!(
+            "HSDir ring ready: {} of {} relays placed",
+            nodes.len(),
+            hsdirs.len()
+        );
+
+        let ring = Arc::new(HsdirRing {
+            period,
+            valid_after,
+            nodes,
+            n_replicas: consensus.params.hsdir_n_replicas,
+            spread_fetch: consensus.params.hsdir_spread_fetch,
+        });
+        *self.hsdir_ring.lock().unwrap() = Some(Arc::clone(&ring));
+        Ok(ring)
+    }
+
     pub fn consensus_summary(&self) -> String {
         self.directory.summary()
     }
+
+    pub fn consensus(&self) -> &Consensus {
+        &self.directory.consensus
+    }
+}
+
+impl HsdirRing {
+    /// The relays that should be holding this descriptor: `hsdir_n_replicas`
+    /// groups of `hsdir_spread_fetch`, in ring order, without repeats.
+    pub fn responsible_for(&self, blinded_key: &[u8; 32]) -> Vec<[u8; 20]> {
+        hsdir::responsible(
+            &self.nodes,
+            blinded_key,
+            &self.period,
+            self.n_replicas,
+            self.spread_fetch,
+        )
+    }
+}
+
+impl TorClient {
+    /// The current descriptor for `address`, fetched from the directory nodes
+    /// responsible for it if it is not already in hand.
+    pub fn descriptor(&self, address: &OnionAddress) -> io::Result<Arc<Descriptor>> {
+        let ring = self.hsdir_ring()?;
+        let blinded = ring.period.blinded_key(&address.public_key)?;
+
+        {
+            let mut cache = self.descriptors.lock().unwrap();
+            cache.retain(|_, entry| entry.expires_at > Instant::now());
+            if let Some(entry) = cache.get(&address.public_key) {
+                if entry.period == ring.period.number {
+                    return Ok(Arc::clone(&entry.descriptor));
+                }
+            }
+        }
+
+        let subcredential = address.subcredential(&blinded);
+        let descriptor = Arc::new(self.fetch_descriptor(&ring, &blinded, &subcredential)?);
+        // A descriptor also expires when the time period turns over, which the
+        // stored period number catches: the blinded key changes with it.
+        let lifetime = Duration::from_secs(descriptor.lifetime_minutes.min(720) * 60);
+        self.descriptors.lock().unwrap().insert(
+            address.public_key,
+            CachedDescriptor {
+                descriptor: Arc::clone(&descriptor),
+                period: ring.period.number,
+                expires_at: Instant::now() + lifetime,
+            },
+        );
+        Ok(descriptor)
+    }
+
+    fn fetch_descriptor(
+        &self,
+        ring: &HsdirRing,
+        blinded: &[u8; 32],
+        subcredential: &[u8; 32],
+    ) -> io::Result<Descriptor> {
+        let mut responsible = ring.responsible_for(blinded);
+        rand::shuffle(&mut responsible)?;
+        let path = format!("/tor/hs/3/{}", base64_encode_unpadded(blinded));
+
+        let mut last: Option<io::Error> = None;
+        let mut all_absent = true;
+        for (attempt, identity) in responsible.iter().enumerate() {
+            // Three nodes is the usual budget. If all three simply had no
+            // copy, the remaining ones are still worth asking: around a time
+            // period boundary the service may not have finished uploading.
+            if attempt >= HSDIR_TRIES && !all_absent {
+                break;
+            }
+            match self.fetch_descriptor_from(identity, &path, blinded, subcredential) {
+                Ok(descriptor) => return Ok(descriptor),
+                Err(e) => {
+                    crate::debug!("hsdir {}: {e}", hex_encode(&identity[..4]));
+                    all_absent &= e.kind() == io::ErrorKind::NotFound;
+                    last = Some(e);
+                }
+            }
+        }
+        Err(match last {
+            // Every directory node that answered said it had no such
+            // descriptor: the service is not published, not unreachable.
+            Some(e) if e.kind() == io::ErrorKind::NotFound || all_absent => io::Error::new(
+                io::ErrorKind::NotFound,
+                "no directory node holds a descriptor for this onion service",
+            ),
+            Some(e) => e,
+            None => invalid_data("no directory node is responsible for this onion service"),
+        })
+    }
+
+    fn fetch_descriptor_from(
+        &self,
+        identity: &[u8; 20],
+        path: &str,
+        blinded: &[u8; 32],
+        subcredential: &[u8; 32],
+    ) -> io::Result<Descriptor> {
+        let relay = self.relay_for(identity)?;
+        let circuit = self.build_circuit_to(&relay)?;
+        let raw = super::dir::fetch::get(&circuit, path);
+        circuit.close();
+        let raw = raw?;
+        if raw.len() > descriptor::MAX_DESCRIPTOR_BYTES {
+            return Err(invalid_data(
+                "onion service descriptor is implausibly large",
+            ));
+        }
+        let text = String::from_utf8(raw)
+            .map_err(|_| invalid_data("onion service descriptor is not UTF-8"))?;
+        let descriptor = Descriptor::parse(&text, blinded, subcredential, now_unix())?;
+        crate::debug!(
+            "descriptor from {}: revision {}, {} introduction points",
+            hex_encode(&identity[..4]),
+            descriptor.revision_counter,
+            descriptor.intro_points.len()
+        );
+        Ok(descriptor)
+    }
+}
+
+/// Create a circuit on `channel` and extend it through `middle` to `last`.
+fn extend_path(
+    channel: &Channel,
+    guard: &RelayInfo,
+    middle: &RelayInfo,
+    last: &RelayInfo,
+) -> io::Result<Circuit> {
+    let circuit = Circuit::create(channel, guard)?;
+    let build = (|| {
+        circuit.extend(middle)?;
+        circuit.extend(last)
+    })();
+    if let Err(e) = build {
+        circuit.close();
+        return Err(e);
+    }
+    crate::debug!(
+        "circuit {} built with {} hops: {} -> {} -> {}",
+        circuit.circ_id(),
+        circuit.hop_count(),
+        guard.addr,
+        middle.addr,
+        last.addr
+    );
+    Ok(circuit)
 }
 
 fn relay_info(status: &RouterStatus, md: &Microdesc) -> RelayInfo {

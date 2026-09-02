@@ -28,6 +28,9 @@ const CERTS_FILE: &str = "certs";
 /// A directory request URL may not name more than this many microdescriptors.
 const MICRODESCS_PER_REQUEST: usize = 92;
 
+/// Above this many batches, report progress: the fetch will take a while.
+const LOUD_FETCH_BATCHES: usize = 4;
+
 /// A one-hop circuit to a directory cache.
 ///
 /// Directory documents are fetched over a single hop, the way C Tor bootstraps:
@@ -237,21 +240,63 @@ impl Directory {
         dir_circuit: &DirCircuit,
     ) -> io::Result<HashMap<[u8; 32], Microdesc>> {
         let mut found: HashMap<[u8; 32], Microdesc> = HashMap::new();
-        let mut missing: Vec<[u8; 32]> = Vec::new();
+        self.stream_microdescs(digests, dir_circuit, &mut |digest, md| {
+            found.insert(digest, md);
+        });
+        Ok(found)
+    }
 
+    /// Just the Ed25519 identity of each relay, for the HSDir hash ring.
+    ///
+    /// The ring needs every HSDir in the consensus, which is thousands of
+    /// microdescriptors; keeping them would cost far more memory than this
+    /// whole program is allowed. Relays whose microdescriptor has no `id
+    /// ed25519` line cannot be placed on the ring at all, so they are simply
+    /// absent from the result.
+    pub fn microdesc_ed_ids(
+        &self,
+        digests: &[[u8; 32]],
+        dir_circuit: &DirCircuit,
+    ) -> HashMap<[u8; 32], [u8; 32]> {
+        let mut found: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+        self.stream_microdescs(digests, dir_circuit, &mut |digest, md| {
+            if let Some(ed) = md.ed_identity {
+                found.insert(digest, ed);
+            }
+        });
+        found
+    }
+
+    /// The shared machinery: serve what the disk cache has, fetch the rest in
+    /// batches, and hand each microdescriptor to `on_each` as it arrives
+    /// rather than accumulating them here.
+    fn stream_microdescs(
+        &self,
+        digests: &[[u8; 32]],
+        dir_circuit: &DirCircuit,
+        on_each: &mut dyn FnMut([u8; 32], Microdesc),
+    ) {
+        let mut missing: Vec<[u8; 32]> = Vec::new();
         for digest in digests {
             match self.cache.load_microdesc(digest) {
                 Some(raw) => match microdesc::Microdesc::parse(&String::from_utf8_lossy(&raw)) {
-                    Ok(md) if md.digest == *digest => {
-                        found.insert(*digest, md);
-                    }
+                    Ok(md) if md.digest == *digest => on_each(*digest, md),
                     _ => missing.push(*digest),
                 },
                 None => missing.push(*digest),
             }
         }
 
-        for batch in missing.chunks(MICRODESCS_PER_REQUEST) {
+        let batches = missing.len().div_ceil(MICRODESCS_PER_REQUEST);
+        for (number, batch) in missing.chunks(MICRODESCS_PER_REQUEST).enumerate() {
+            // A handful of relays is routine; thousands means the HSDir table
+            // is being built, which takes long enough to deserve a word.
+            if batches > LOUD_FETCH_BATCHES {
+                crate::info!(
+                    "fetching microdescriptors: batch {} of {batches}",
+                    number + 1
+                );
+            }
             let path = format!(
                 "/tor/micro/d/{}",
                 batch
@@ -278,10 +323,9 @@ impl Directory {
                 if let Err(e) = self.cache.store_microdesc(&md.digest, body.as_bytes()) {
                     crate::debug!("could not cache microdescriptor: {e}");
                 }
-                found.insert(md.digest, md);
+                on_each(md.digest, md);
             }
         }
-        Ok(found)
     }
 }
 

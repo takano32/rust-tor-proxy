@@ -68,11 +68,70 @@ impl RouterStatus {
     }
 }
 
+/// The consensus parameters this client reads (param-spec.md). Everything
+/// else on the `params` line is dropped with the rest of the text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Params {
+    /// `hsdir-interval`: the length of a time period, in minutes.
+    pub hsdir_interval: u64,
+    /// How many places in the hash ring a descriptor is stored at.
+    pub hsdir_n_replicas: u8,
+    /// How many nodes after each of those places a client may fetch from.
+    pub hsdir_spread_fetch: usize,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            hsdir_interval: 1440,
+            hsdir_n_replicas: 2,
+            hsdir_spread_fetch: 3,
+        }
+    }
+}
+
+impl Params {
+    /// Parse a `params` line, keeping defaults for anything absent or out of
+    /// the range the spec allows.
+    fn parse(args: &str) -> Self {
+        let mut out = Self::default();
+        for field in args.split_whitespace() {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            match key {
+                "hsdir-interval" => {
+                    if let Some(v) = value.parse().ok().filter(|v| (30..=14_400).contains(v)) {
+                        out.hsdir_interval = v;
+                    }
+                }
+                "hsdir_n_replicas" => {
+                    if let Some(v) = value.parse().ok().filter(|v| (1..=16).contains(v)) {
+                        out.hsdir_n_replicas = v;
+                    }
+                }
+                "hsdir_spread_fetch" => {
+                    if let Some(v) = value.parse().ok().filter(|v| (1..=128).contains(v)) {
+                        out.hsdir_spread_fetch = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 pub struct Consensus {
     pub valid_after: u64,
     pub fresh_until: u64,
     pub valid_until: u64,
     pub routers: Vec<RouterStatus>,
+    pub params: Params,
+    /// The two shared random values, when the authorities published them
+    /// (proposal 250). Absent only if the shared-randomness protocol failed.
+    pub shared_rand_current: Option<[u8; 32]>,
+    pub shared_rand_previous: Option<[u8; 32]>,
 }
 
 impl Consensus {
@@ -166,7 +225,20 @@ pub fn parse_and_verify(text: &str, certs: &[KeyCertificate], now: u64) -> io::R
         fresh_until,
         valid_until,
         routers,
+        params: netdoc::item(text, "params")
+            .map(Params::parse)
+            .unwrap_or_default(),
+        shared_rand_current: shared_random(text, "shared-rand-current-value"),
+        shared_rand_previous: shared_random(text, "shared-rand-previous-value"),
     })
+}
+
+/// `"shared-rand-current-value" SP NUM_REVEALS SP VALUE`, where the value is
+/// 32 base64 bytes.
+fn shared_random(text: &str, keyword: &str) -> Option<[u8; 32]> {
+    let args = netdoc::item(text, keyword)?;
+    let value = args.split_whitespace().nth(1)?;
+    netdoc::base64_fixed::<32>(value).ok()
 }
 
 /// How much of the document the signatures cover: everything up to and

@@ -61,9 +61,18 @@ fn parse_response(mut raw: Vec<u8>) -> io::Result<Vec<u8>> {
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| invalid_data(format!("bad HTTP status line {status_line:?}")))?;
     if status != 200 {
-        return Err(invalid_data(format!(
-            "directory server answered HTTP {status}"
-        )));
+        // 404 is not a malformed answer: for an onion service descriptor it
+        // is the ordinary "not on this directory node", and the caller moves
+        // on to the next one.
+        let kind = if status == 404 {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        return Err(io::Error::new(
+            kind,
+            format!("directory server answered HTTP {status}"),
+        ));
     }
     // Drop the header in place so the (possibly multi-megabyte) body is not
     // copied into a second allocation.
@@ -90,6 +99,16 @@ mod tests {
         let raw = b"HTTP/1.0 404 Not found\r\n\r\n".to_vec();
         let err = parse_response(raw).unwrap_err();
         assert!(err.to_string().contains("404"), "{err}");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "404 must be its own kind"
+        );
+        let raw = b"HTTP/1.0 503 Busy\r\n\r\n".to_vec();
+        assert_eq!(
+            parse_response(raw).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(parse_response(b"garbage".to_vec()).is_err());
         assert!(parse_response(b"nonsense\r\n\r\nbody".to_vec()).is_err());
     }

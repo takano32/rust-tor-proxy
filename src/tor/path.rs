@@ -38,10 +38,19 @@ pub struct PathConstraints {
 
 impl PathConstraints {
     pub fn add(&mut self, router: &RouterStatus, microdesc: Option<&Microdesc>) {
-        self.identities.push(router.identity);
-        self.subnets.push(router.subnet16());
-        self.families
-            .push(microdesc.map(|m| m.family.clone()).unwrap_or_default());
+        self.add_relay(
+            router.identity,
+            router.subnet16(),
+            microdesc.map(|m| m.family.clone()).unwrap_or_default(),
+        );
+    }
+
+    /// Add a relay known by address rather than by consensus entry -- an
+    /// introduction point may be named only in a service's descriptor.
+    pub fn add_relay(&mut self, identity: [u8; 20], subnet16: [u8; 2], family: Vec<[u8; 20]>) {
+        self.identities.push(identity);
+        self.subnets.push(subnet16);
+        self.families.push(family);
     }
 
     /// True if `router` may join the path.
@@ -168,6 +177,9 @@ mod tests {
             fresh_until: 0,
             valid_until: u64::MAX,
             routers,
+            params: crate::tor::dir::consensus::Params::default(),
+            shared_rand_current: None,
+            shared_rand_previous: None,
         }
     }
 

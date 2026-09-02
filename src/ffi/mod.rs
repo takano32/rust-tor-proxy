@@ -181,6 +181,9 @@ openssl_bindings! {
     fn EVP_DigestUpdate(ctx: *mut c_void, data: *const c_void, count: usize) -> c_int;
     fn EVP_DigestFinal_ex(ctx: *mut c_void, md: *mut c_uchar, size: *mut c_uint) -> c_int;
     fn EVP_MD_CTX_copy_ex(out: *mut c_void, inp: *const c_void) -> c_int;
+    fn EVP_sha3_256() -> *const c_void;
+    fn EVP_shake256() -> *const c_void;
+    fn EVP_DigestFinalXOF(ctx: *mut c_void, md: *mut c_uchar, size: usize) -> c_int;
 
     fn HMAC(
         md: *const c_void,
@@ -193,6 +196,7 @@ openssl_bindings! {
     ) -> *mut c_uchar;
 
     fn EVP_aes_128_ctr() -> *const c_void;
+    fn EVP_aes_256_ctr() -> *const c_void;
     fn EVP_CIPHER_CTX_new() -> *mut c_void;
     fn EVP_CIPHER_CTX_free(ctx: *mut c_void);
     fn EVP_EncryptInit_ex(

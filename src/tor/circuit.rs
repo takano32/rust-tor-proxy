@@ -600,7 +600,7 @@ fn decrypt_inbound(state: &mut State, body: &mut [u8]) -> Option<usize> {
         // Try on a copy: an unrecognised cell must not advance the digest.
         let mut trial = state.hops[index].backward_digest.clone();
         trial.update(body);
-        let full = trial.peek();
+        let full = trial.peek_prefix::<20>();
         if full[..4] == claimed {
             state.hops[index].backward_digest = trial;
             state.last_recv_digest = full;
@@ -1117,7 +1117,7 @@ mod tests {
         let before: Vec<[u8; 20]> = client
             .hops
             .iter()
-            .map(|h| h.backward_digest.peek())
+            .map(|h| h.backward_digest.peek_prefix::<20>())
             .collect();
         let mut junk = vec![0u8; CELL_BODY_LEN];
         junk[1] = 0;
@@ -1126,7 +1126,7 @@ mod tests {
         let after: Vec<[u8; 20]> = client
             .hops
             .iter()
-            .map(|h| h.backward_digest.peek())
+            .map(|h| h.backward_digest.peek_prefix::<20>())
             .collect();
         assert_eq!(before, after);
     }

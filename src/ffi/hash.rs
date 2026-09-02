@@ -1,4 +1,4 @@
-//! SHA-1 and SHA-256, one-shot and incremental.
+//! SHA-1, SHA-256 and SHA3-256, one-shot and incremental, plus SHAKE-256.
 
 use std::ffi::{c_uint, c_void};
 
@@ -13,6 +13,13 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     digest_into(unsafe { EVP_sha256() }, data, &mut out);
+    out
+}
+
+/// SHA3-256, which is `H()` throughout the onion service protocol.
+pub fn sha3_256(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    digest_into(unsafe { EVP_sha3_256() }, data, &mut out);
     out
 }
 
@@ -33,14 +40,36 @@ fn digest_into(md: *const c_void, data: &[u8], out: &mut [u8]) {
     assert_eq!(len as usize, out.len());
 }
 
-/// A running SHA-1 digest whose intermediate value can be read without ending
-/// it.
+/// SHAKE-256 as an extendable output function: `KDF(x, n)` in rend-spec.
+///
+/// `EVP_DigestFinalXOF` may be called only once per context, so the whole
+/// output is taken in a single call and the length has to be known up front.
+pub fn shake256(data: &[u8], out_len: usize) -> Vec<u8> {
+    let ctx = unsafe { EVP_MD_CTX_new() };
+    assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
+    let mut out = vec![0u8; out_len];
+    let rc = unsafe {
+        let ok = EVP_DigestInit_ex(ctx, EVP_shake256(), std::ptr::null_mut())
+            & EVP_DigestUpdate(ctx, data.as_ptr() as *const c_void, data.len())
+            & EVP_DigestFinalXOF(ctx, out.as_mut_ptr(), out_len);
+        EVP_MD_CTX_free(ctx);
+        ok
+    };
+    assert_eq!(rc, 1, "SHAKE-256 failed: {}", openssl_errors());
+    out
+}
+
+/// A running digest whose intermediate value can be read without ending it.
 ///
 /// Tor's relay-cell integrity check needs exactly that: every cell's digest is
-/// the running hash of every relay cell sent so far on the circuit. `peek`
+/// the running hash of every relay cell sent so far on that hop. `peek_into`
 /// finalises a *copy* of the context, so the original keeps accumulating.
+///
+/// The algorithm is chosen per hop: SHA-1 for ordinary relays, SHA3-256 for
+/// the virtual hop of a rendezvous circuit.
 pub struct Digest {
     ctx: *mut c_void,
+    output_len: usize,
 }
 
 // The context is owned exclusively by this value.
@@ -48,11 +77,23 @@ unsafe impl Send for Digest {}
 
 impl Digest {
     pub fn sha1() -> Self {
+        Self::new(unsafe { EVP_sha1() }, 20)
+    }
+
+    pub fn sha3_256() -> Self {
+        Self::new(unsafe { EVP_sha3_256() }, 32)
+    }
+
+    fn new(md: *const c_void, output_len: usize) -> Self {
         let ctx = unsafe { EVP_MD_CTX_new() };
         assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
-        let rc = unsafe { EVP_DigestInit_ex(ctx, EVP_sha1(), std::ptr::null_mut()) };
+        let rc = unsafe { EVP_DigestInit_ex(ctx, md, std::ptr::null_mut()) };
         assert_eq!(rc, 1, "EVP_DigestInit_ex failed: {}", openssl_errors());
-        Self { ctx }
+        Self { ctx, output_len }
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.output_len
     }
 
     pub fn update(&mut self, data: &[u8]) {
@@ -60,22 +101,29 @@ impl Digest {
         assert_eq!(rc, 1, "EVP_DigestUpdate failed: {}", openssl_errors());
     }
 
-    /// The digest value as of right now; the running state is unchanged.
-    pub fn peek(&self) -> [u8; 20] {
+    /// Fill `out` with the leading bytes of the digest value as of right now;
+    /// the running state is unchanged.
+    pub fn peek_into(&self, out: &mut [u8]) {
+        assert!(
+            out.len() <= self.output_len,
+            "asked for {} bytes of a {}-byte digest",
+            out.len(),
+            self.output_len
+        );
         let copy = self.clone();
-        let mut out = [0u8; 20];
+        let mut full = [0u8; 64];
         let mut len: c_uint = 0;
-        let rc = unsafe { EVP_DigestFinal_ex(copy.ctx, out.as_mut_ptr(), &mut len) };
+        let rc = unsafe { EVP_DigestFinal_ex(copy.ctx, full.as_mut_ptr(), &mut len) };
         assert_eq!(rc, 1, "EVP_DigestFinal_ex failed: {}", openssl_errors());
-        assert_eq!(len as usize, out.len());
-        out
+        assert_eq!(len as usize, self.output_len);
+        out.copy_from_slice(&full[..out.len()]);
     }
 
-    /// First `N` bytes of [`Digest::peek`], the form Tor's relay header wants.
+    /// First `N` bytes of the running digest, the form Tor's relay header and
+    /// its authenticated SENDMEs want.
     pub fn peek_prefix<const N: usize>(&self) -> [u8; N] {
-        let full = self.peek();
         let mut out = [0u8; N];
-        out.copy_from_slice(&full[..N]);
+        self.peek_into(&mut out);
         out
     }
 }
@@ -86,7 +134,10 @@ impl Clone for Digest {
         assert!(!ctx.is_null(), "EVP_MD_CTX_new failed");
         let rc = unsafe { EVP_MD_CTX_copy_ex(ctx, self.ctx) };
         assert_eq!(rc, 1, "EVP_MD_CTX_copy_ex failed: {}", openssl_errors());
-        Self { ctx }
+        Self {
+            ctx,
+            output_len: self.output_len,
+        }
     }
 }
 
@@ -117,20 +168,68 @@ mod tests {
         );
     }
 
-    /// `peek` must not disturb the running state, and a clone must be able to
-    /// diverge from it: both are what the relay-cell digest check relies on.
+    /// SHA3-256, not Keccak-256: the two differ only in the padding byte, so a
+    /// known vector is the only thing that tells them apart.
+    #[test]
+    fn known_sha3_digests() {
+        assert_eq!(
+            sha3_256(b"abc").to_vec(),
+            hex_decode("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532").unwrap()
+        );
+        assert_eq!(
+            sha3_256(b"").to_vec(),
+            hex_decode("a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a").unwrap()
+        );
+    }
+
+    #[test]
+    fn known_shake256_output() {
+        assert_eq!(
+            shake256(b"abc", 32),
+            hex_decode("483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739").unwrap()
+        );
+        // A longer request must extend the same stream, not restart it.
+        let long = shake256(b"abc", 64);
+        assert_eq!(&long[..32], &shake256(b"abc", 32)[..]);
+        assert_eq!(shake256(b"", 0), Vec::<u8>::new());
+    }
+
+    /// `peek_into` must not disturb the running state, and a clone must be
+    /// able to diverge from it: both are what the relay-cell digest check
+    /// relies on.
     #[test]
     fn running_digest_peek_and_clone() {
         let mut d = Digest::sha1();
         d.update(b"a");
         d.update(b"b");
-        assert_eq!(d.peek(), sha1(b"ab"));
+        assert_eq!(d.peek_prefix::<20>(), sha1(b"ab"));
 
         let mut branch = d.clone();
         branch.update(b"X");
         d.update(b"c");
-        assert_eq!(branch.peek(), sha1(b"abX"));
-        assert_eq!(d.peek(), sha1(b"abc"));
+        assert_eq!(branch.peek_prefix::<20>(), sha1(b"abX"));
+        assert_eq!(d.peek_prefix::<20>(), sha1(b"abc"));
         assert_eq!(d.peek_prefix::<4>(), sha1(b"abc")[..4]);
+    }
+
+    /// The same machinery has to work for the SHA3-256 hop of a rendezvous
+    /// circuit, where 20 bytes is a prefix of a 32-byte digest.
+    #[test]
+    fn running_sha3_digest() {
+        let mut d = Digest::sha3_256();
+        assert_eq!(d.output_len(), 32);
+        d.update(b"ab");
+        assert_eq!(d.peek_prefix::<32>(), sha3_256(b"ab"));
+        assert_eq!(d.peek_prefix::<20>(), sha3_256(b"ab")[..20]);
+        let mut branch = d.clone();
+        branch.update(b"c");
+        assert_eq!(branch.peek_prefix::<32>(), sha3_256(b"abc"));
+        assert_eq!(d.peek_prefix::<32>(), sha3_256(b"ab"));
+    }
+
+    #[test]
+    #[should_panic(expected = "asked for 32 bytes of a 20-byte digest")]
+    fn peeking_past_the_end_of_a_sha1_digest_is_a_bug() {
+        Digest::sha1().peek_prefix::<32>();
     }
 }

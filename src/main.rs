@@ -4,6 +4,7 @@
 mod log;
 
 mod config;
+mod crypto;
 mod ffi;
 mod relay;
 mod socks5;

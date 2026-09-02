@@ -56,6 +56,24 @@ pub fn line_start_of(text: &str, keyword: &str) -> Option<usize> {
     text.find(&pattern).map(|i| i + 1)
 }
 
+/// The object that belongs to the first item with this keyword.
+///
+/// Unlike [`object`], the block has to start on the line immediately after the
+/// keyword, so that a document carrying several objects of the same kind --
+/// an onion service descriptor has two `ED25519 CERT`s per introduction point
+/// -- cannot hand back the wrong one.
+pub fn item_object(text: &str, keyword: &str, label: &str) -> io::Result<Vec<u8>> {
+    let after = line_end_after(text, keyword)
+        .ok_or_else(|| invalid_data(format!("document has no {keyword}")))?;
+    let rest = &text[after..];
+    if !rest.starts_with(&format!("-----BEGIN {label}-----")) {
+        return Err(invalid_data(format!(
+            "{keyword} is not followed by a {label}"
+        )));
+    }
+    object(rest, label)
+}
+
 /// A parsed base64 argument of a fixed size.
 pub fn base64_fixed<const N: usize>(value: &str) -> io::Result<[u8; N]> {
     let bytes = base64_decode(value)?;
@@ -96,6 +114,28 @@ r Unnamed AAAA 2026-09-02 10:00:00 1.2.3.4 443 0
             "network-status-version 3 microdesc\nvalid-after 2026-09-02 10:00:00\n"
         );
         assert_eq!(line_start_of(DOC, "nothing"), None);
+    }
+
+    #[test]
+    fn attaches_objects_to_their_own_item() {
+        let doc = concat!(
+            "auth-key\n-----BEGIN ED25519 CERT-----\naGVsbG8=\n-----END ED25519 CERT-----\n",
+            "enc-key-cert\n-----BEGIN ED25519 CERT-----\nd29ybGQ=\n-----END ED25519 CERT-----\n"
+        );
+        assert_eq!(
+            item_object(doc, "auth-key", "ED25519 CERT").unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            item_object(doc, "enc-key-cert", "ED25519 CERT").unwrap(),
+            b"world"
+        );
+        assert!(item_object(doc, "missing", "ED25519 CERT").is_err());
+        // An item whose object does not follow it immediately must not pick up
+        // the next one along.
+        assert!(item_object(doc, "auth-key", "MESSAGE").is_err());
+        let stray = "legacy-key\nauth-key\n-----BEGIN ED25519 CERT-----\naGk=\n-----END ED25519 CERT-----\n";
+        assert!(item_object(stray, "legacy-key", "ED25519 CERT").is_err());
     }
 
     #[test]

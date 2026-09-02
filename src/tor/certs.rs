@@ -21,6 +21,10 @@ use crate::util::invalid_data;
 
 pub const CERT_TYPE_IDENTITY_V_SIGNING: u8 = 4;
 pub const CERT_TYPE_SIGNING_V_TLS: u8 = 5;
+/// Onion service descriptor certificates (rend-spec, cert-spec.md).
+pub const CERT_TYPE_HS_DESC_SIGN: u8 = 0x08;
+pub const CERT_TYPE_HS_INTRO_AUTH: u8 = 0x09;
+pub const CERT_TYPE_HS_INTRO_ENC: u8 = 0x0B;
 
 /// CERT_KEY_TYPE values (cert-spec.md, "List of certified key types").
 const KEY_TYPE_ED25519: u8 = 1;
