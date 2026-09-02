@@ -10,11 +10,9 @@
 use std::io;
 
 use super::int8;
+
 use crate::crypto::ed25519_point;
 use crate::ffi::hash::sha3_256;
-
-/// `hsdir-interval` default, in minutes (one day).
-pub const DEFAULT_PERIOD_LENGTH: u64 = 1440;
 
 /// Time periods are offset from the Unix epoch by twelve hours, so that they
 /// begin at 12:00 UTC rather than midnight -- half a day out of phase with the
@@ -74,8 +72,14 @@ impl TimePeriod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tor::dir::consensus::Params;
     use crate::tor::hs::address::OnionAddress;
     use crate::util::parse_datetime;
+
+    /// The `hsdir-interval` a consensus that says nothing implies.
+    fn default_period_length() -> u64 {
+        Params::default().hsdir_interval
+    }
 
     /// The worked example in rend-spec: 2016-04-13 12:00 UTC is where period
     /// 16903 ends and 16904 begins.
@@ -84,25 +88,25 @@ mod tests {
         let just_before = parse_datetime("2016-04-13", "11:59:59").unwrap();
         let at_noon = parse_datetime("2016-04-13", "12:00:00").unwrap();
         assert_eq!(
-            TimePeriod::containing(just_before, DEFAULT_PERIOD_LENGTH).number,
+            TimePeriod::containing(just_before, default_period_length()).number,
             16903
         );
         assert_eq!(
-            TimePeriod::containing(at_noon, DEFAULT_PERIOD_LENGTH).number,
+            TimePeriod::containing(at_noon, default_period_length()).number,
             16904
         );
         // The spec's other example: 11:15:01 on the same day is still 16903.
         assert_eq!(
-            TimePeriod::containing(1_460_546_101, DEFAULT_PERIOD_LENGTH).number,
+            TimePeriod::containing(1_460_546_101, default_period_length()).number,
             16903
         );
         // A day later is the next period, and only one.
         assert_eq!(
-            TimePeriod::containing(at_noon + 86_399, DEFAULT_PERIOD_LENGTH).number,
+            TimePeriod::containing(at_noon + 86_399, default_period_length()).number,
             16904
         );
         assert_eq!(
-            TimePeriod::containing(at_noon + 86_400, DEFAULT_PERIOD_LENGTH).number,
+            TimePeriod::containing(at_noon + 86_400, default_period_length()).number,
             16905
         );
     }
@@ -163,7 +167,7 @@ mod tests {
                 .unwrap();
         let period = TimePeriod {
             number: 19_000,
-            length: DEFAULT_PERIOD_LENGTH,
+            length: default_period_length(),
         };
         let blinded = period.blinded_key(&address.public_key).unwrap();
         assert_ne!(blinded, address.public_key);
@@ -171,7 +175,7 @@ mod tests {
 
         let next = TimePeriod {
             number: 19_001,
-            length: DEFAULT_PERIOD_LENGTH,
+            length: default_period_length(),
         };
         assert_ne!(blinded, next.blinded_key(&address.public_key).unwrap());
         // Deterministic: the same period always gives the same key.

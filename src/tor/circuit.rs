@@ -654,23 +654,8 @@ impl From<StreamEnd> for io::Error {
 /// Build the EXTEND2 payload: link specifiers in the order the spec asks for
 /// (IPv4, legacy identity, Ed25519 identity) then the ntor onion skin.
 fn build_extend2(next: &RelayInfo, skin: &[u8]) -> Vec<u8> {
-    let mut specs: Vec<(u8, Vec<u8>)> = Vec::with_capacity(3);
-    let mut ipv4 = Vec::with_capacity(6);
-    ipv4.extend_from_slice(&next.addr.ip().octets());
-    ipv4.extend_from_slice(&next.addr.port().to_be_bytes());
-    specs.push((0x00, ipv4));
-    specs.push((0x02, next.rsa_identity.to_vec()));
-    if let Some(ed) = next.ed_identity {
-        specs.push((0x03, ed.to_vec()));
-    }
-
-    let mut out = Vec::with_capacity(64 + skin.len());
-    out.push(specs.len() as u8);
-    for (kind, value) in specs {
-        out.push(kind);
-        out.push(value.len() as u8);
-        out.extend_from_slice(&value);
-    }
+    let mut out = next.link_specifiers();
+    out.reserve(4 + skin.len());
     out.extend_from_slice(&ntor::HANDSHAKE_TYPE_NTOR.to_be_bytes());
     out.extend_from_slice(&(skin.len() as u16).to_be_bytes());
     out.extend_from_slice(skin);
@@ -1348,8 +1333,9 @@ mod tests {
         claimed.copy_from_slice(&body[5..9]);
         body[5..9].fill(0);
         peers[target].digest_from_client.update(&body);
-        assert_eq!(peers[target].digest_from_client.output_len(), 32);
         assert_eq!(peers[target].digest_from_client.peek_prefix::<4>(), claimed);
+        // A 32-byte peek would panic on a SHA-1 hop: this one really is SHA3.
+        let _ = peers[target].digest_from_client.peek_prefix::<32>();
     }
 
     /// The inbound path must recognise a cell from the virtual hop, and an

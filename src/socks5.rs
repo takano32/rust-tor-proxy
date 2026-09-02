@@ -3,6 +3,9 @@
 //! Host names are passed to the exit relay untouched: resolving them locally
 //! would leak the destination to the local resolver, which is why clients
 //! should always use `--socks5-hostname` / `socks5h://`.
+//!
+//! A `.onion` host name never reaches an exit at all: it is a v3 onion
+//! address, and goes to a rendezvous circuit instead.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -12,6 +15,7 @@ use std::time::Duration;
 use crate::relay;
 use crate::tor::circuit::{self, StreamEnd};
 use crate::tor::client::TorClient;
+use crate::tor::hs::address::{self, OnionAddress};
 use crate::util::invalid_data;
 
 const VERSION: u8 = 0x05;
@@ -59,12 +63,24 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
             return;
         }
     };
-    crate::info!("{peer} -> {}:{}", request.host, request.port);
+    // An onion address names the destination in full, so it is only ever
+    // logged at debug: an info line would put every service a user visits in
+    // the log.
+    if address::is_onion(&request.host) {
+        crate::info!("{peer} -> an onion service, port {}", request.port);
+        crate::debug!("{peer} -> {}:{}", request.host, request.port);
+    } else {
+        crate::info!("{peer} -> {}:{}", request.host, request.port);
+    }
 
-    let stream = match tor.connect(&request.host, request.port) {
+    let stream = match connect(tor, &request) {
         Ok(stream) => stream,
         Err(e) => {
-            crate::warn!("{peer}: {}:{} failed: {e}", request.host, request.port);
+            if address::is_onion(&request.host) {
+                crate::warn!("{peer}: onion service on port {} failed: {e}", request.port);
+            } else {
+                crate::warn!("{peer}: {}:{} failed: {e}", request.host, request.port);
+            }
             let _ = send_reply(&mut client, reply_code(&e));
             return;
         }
@@ -82,6 +98,36 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         crate::debug!("{peer}: relay ended: {e}");
     }
     stream.close();
+}
+
+/// Where a request wants to go.
+enum Destination {
+    /// A host name or address for an exit relay to resolve and connect to.
+    Exit,
+    /// A v3 onion service, reached through a rendezvous circuit.
+    Onion(OnionAddress),
+}
+
+/// Decide which of the two a host name names.
+///
+/// A `.onion` that does not parse -- a version 2 address, or a mistyped one --
+/// is reported as an unreachable host rather than a general failure: no exit
+/// could resolve it either, so the client should not retry.
+fn classify(host: &str) -> io::Result<Destination> {
+    if !address::is_onion(host) {
+        return Ok(Destination::Exit);
+    }
+    match OnionAddress::parse(host) {
+        Ok(onion) => Ok(Destination::Onion(onion)),
+        Err(e) => Err(io::Error::new(io::ErrorKind::NotFound, e)),
+    }
+}
+
+fn connect(tor: &Arc<TorClient>, request: &Request) -> io::Result<crate::tor::circuit::TorStream> {
+    match classify(&request.host)? {
+        Destination::Exit => tor.connect(&request.host, request.port),
+        Destination::Onion(onion) => tor.connect_onion(&onion, request.port),
+    }
 }
 
 /// Run the greeting and the CONNECT request.
@@ -201,6 +247,12 @@ mod tests {
         });
         let (mut server, _) = listener.accept().unwrap();
         let result = negotiate(&mut server);
+        // Close in two steps. A socket dropped while unread bytes are still
+        // in its receive buffer -- which is exactly what a rejected request
+        // leaves behind -- makes the kernel send RST rather than FIN, and the
+        // RST can throw away the reply the client has not read yet.
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        let _ = server.read_to_end(&mut Vec::new());
         drop(server);
         (result, client.join().unwrap())
     }
@@ -264,6 +316,37 @@ mod tests {
         let request = vec![0x04, 0x01, 0x00, 0x50];
         let (parsed, _) = negotiate_with(&request);
         assert!(parsed.is_err());
+    }
+
+    /// A `.onion` host is routed to the rendezvous path, and one that cannot
+    /// be a v3 address is refused as unreachable -- which is what SOCKS code
+    /// 04 means, and what the client should see rather than a retryable
+    /// general failure.
+    #[test]
+    fn onion_hosts_are_routed_and_bad_ones_are_unreachable() {
+        let valid = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
+        assert!(matches!(classify(valid).unwrap(), Destination::Onion(_)));
+        assert!(matches!(
+            classify(&valid.to_uppercase()).unwrap(),
+            Destination::Onion(_)
+        ));
+        assert!(matches!(
+            classify("example.com").unwrap(),
+            Destination::Exit
+        ));
+        assert!(matches!(
+            classify("93.184.216.34").unwrap(),
+            Destination::Exit
+        ));
+
+        for bad in ["expyuzz4wqqyqhjn.onion", "nope.onion", "aaaa.onion"] {
+            let err = match classify(bad) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad} must not parse as a v3 address"),
+            };
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{bad}");
+            assert_eq!(reply_code(&err), REP_HOST_UNREACHABLE, "{bad}");
+        }
     }
 
     #[test]

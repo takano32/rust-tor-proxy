@@ -129,6 +129,19 @@ pub fn exit_candidates<'a>(
         .collect()
 }
 
+/// Candidates for a rendezvous point. It only forwards cells between two
+/// circuits, so nothing about exiting matters -- speed and stability do.
+pub fn rendezvous_candidates<'a>(
+    consensus: &'a Consensus,
+    constraints: &PathConstraints,
+) -> Vec<&'a RouterStatus> {
+    consensus
+        .routers
+        .iter()
+        .filter(|r| r.has(USABLE | FLAG_FAST | FLAG_STABLE) && constraints.accepts(r, None))
+        .collect()
+}
+
 pub fn middle_candidates<'a>(
     consensus: &'a Consensus,
     constraints: &PathConstraints,

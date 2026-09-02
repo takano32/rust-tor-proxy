@@ -17,13 +17,14 @@ use super::certs::now_unix;
 use super::channel::Channel;
 use super::circuit::{Circuit, TorStream};
 use super::dir::cache::Cache;
-use super::dir::consensus::{Consensus, RouterStatus, FLAG_HSDIR};
+use super::dir::consensus::{RouterStatus, FLAG_HSDIR};
 use super::dir::microdesc::Microdesc;
 use super::dir::{DirCircuit, Directory};
 use super::hs::address::OnionAddress;
 use super::hs::blind::TimePeriod;
 use super::hs::descriptor::{self, Descriptor};
 use super::hs::hsdir::{self, RingNode};
+use super::hs::rendezvous;
 use super::path::{self, PathConstraints};
 use super::RelayInfo;
 use crate::ffi::rand;
@@ -37,6 +38,8 @@ const MAX_CIRCUITS: usize = 8;
 const EXIT_SAMPLE: usize = 40;
 /// How many middle candidates to fetch microdescriptors for.
 const MIDDLE_SAMPLE: usize = 8;
+/// How many rendezvous point candidates to fetch microdescriptors for.
+const RENDEZVOUS_SAMPLE: usize = 8;
 /// Cap on the in-memory microdescriptor cache.
 const MAX_CACHED_MICRODESCS: usize = 2000;
 /// How many times to rebuild a circuit before giving up on a request.
@@ -68,6 +71,13 @@ pub struct TorClient {
     /// Onion service descriptors, in memory only: they name the service's
     /// introduction points, which is not something to leave on disk.
     descriptors: Mutex<HashMap<[u8; 32], CachedDescriptor>>,
+    /// One rendezvous circuit per onion service, carrying every stream to it.
+    onion_circuits: Mutex<HashMap<[u8; 32], PooledOnionCircuit>>,
+}
+
+struct PooledOnionCircuit {
+    circuit: Circuit,
+    built: Instant,
 }
 
 struct CachedDescriptor {
@@ -115,6 +125,7 @@ impl TorClient {
             microdescs: Mutex::new(HashMap::new()),
             hsdir_ring: Mutex::new(None),
             descriptors: Mutex::new(HashMap::new()),
+            onion_circuits: Mutex::new(HashMap::new()),
         };
         // Open the guard channel now: an unreachable guard should be replaced
         // during startup, not on the first request.
@@ -304,6 +315,30 @@ impl TorClient {
         let md = fetched
             .get(&chosen.microdesc_digest)
             .ok_or_else(|| invalid_data("middle microdescriptor vanished"))?;
+        Ok(relay_info(chosen, md))
+    }
+
+    /// Pick a rendezvous point. It never sees the destination, only that two
+    /// circuits met, so the only requirements are that it is fast, stable and
+    /// not somewhere the rest of the path already goes.
+    pub fn choose_rendezvous_point(&self) -> io::Result<RelayInfo> {
+        let mut constraints = PathConstraints::default();
+        if let Ok(guard) = self.ensure_guard() {
+            self.constrain(&mut constraints, &guard);
+        }
+        let pool = path::rendezvous_candidates(&self.directory.consensus, &constraints);
+        let sampled = path::sample(&pool, RENDEZVOUS_SAMPLE)?;
+        let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
+        let fetched = self.load_microdescs(&wanted)?;
+        let usable: Vec<&RouterStatus> = sampled
+            .iter()
+            .copied()
+            .filter(|r| fetched.contains_key(&r.microdesc_digest))
+            .collect();
+        let chosen = path::weighted_choice(&usable)?;
+        let md = fetched
+            .get(&chosen.microdesc_digest)
+            .ok_or_else(|| invalid_data("rendezvous point microdescriptor vanished"))?;
         Ok(relay_info(chosen, md))
     }
 
@@ -604,7 +639,11 @@ impl TorClient {
         self.directory.summary()
     }
 
-    pub fn consensus(&self) -> &Consensus {
+    /// The verified consensus. Only the live tests reach for this; everything
+    /// the client itself needs is already folded into the ring and the path
+    /// selection above.
+    #[cfg(test)]
+    pub fn consensus(&self) -> &super::dir::consensus::Consensus {
         &self.directory.consensus
     }
 }
@@ -654,6 +693,115 @@ impl TorClient {
             },
         );
         Ok(descriptor)
+    }
+
+    /// Drop a cached descriptor, so the next request fetches a fresh one.
+    /// Used when the introduction points reject the authentication key they
+    /// name, which means the descriptor we hold has been replaced.
+    fn forget_descriptor(&self, address: &OnionAddress) {
+        self.descriptors.lock().unwrap().remove(&address.public_key);
+    }
+
+    /// Open a stream to `address:port` through a rendezvous circuit.
+    pub fn connect_onion(&self, address: &OnionAddress, port: u16) -> io::Result<TorStream> {
+        let mut last: Option<io::Error> = None;
+        for attempt in 0..CONNECT_ATTEMPTS {
+            let circuit = match self.onion_circuit(address) {
+                Ok(circuit) => circuit,
+                Err(e) => {
+                    // A service that is simply not published will fail the
+                    // same way every time; do not spend three tries on it.
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::PermissionDenied
+                    {
+                        return Err(e);
+                    }
+                    crate::debug!("attempt {}: no rendezvous circuit: {e}", attempt + 1);
+                    last = Some(e);
+                    continue;
+                }
+            };
+            match circuit.begin_stream_onion(port) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    crate::debug!("attempt {}: onion BEGIN failed: {e}", attempt + 1);
+                    self.discard_onion_circuit(address);
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("could not reach the onion service")))
+    }
+
+    /// The rendezvous circuit for this service, reusing the open one if there
+    /// is one: every stream to a service shares a single circuit, as C Tor
+    /// does.
+    fn onion_circuit(&self, address: &OnionAddress) -> io::Result<Circuit> {
+        {
+            let mut open = self.onion_circuits.lock().unwrap();
+            open.retain(|_, c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
+            if let Some(found) = open.get(&address.public_key) {
+                return Ok(found.circuit.clone());
+            }
+        }
+
+        let subcredential = self.onion_keys(address)?.1;
+        let descriptor = self.descriptor(address)?;
+        let circuit = match rendezvous::establish(self, &descriptor, &subcredential) {
+            Ok(circuit) => circuit,
+            Err(failure) if failure.descriptor_is_stale => {
+                // The introduction points do not recognise the keys we named,
+                // so the descriptor moved on without us. Try once more with a
+                // fresh one, and no further: a service that keeps saying this
+                // is one we cannot reach.
+                crate::debug!("descriptor looks stale; refetching once");
+                self.forget_descriptor(address);
+                let descriptor = self.descriptor(address)?;
+                rendezvous::establish(self, &descriptor, &subcredential)
+                    .map_err(|failure| failure.error)?
+            }
+            Err(failure) => return Err(failure.error),
+        };
+
+        let mut open = self.onion_circuits.lock().unwrap();
+        open.retain(|_, c| !c.circuit.is_closed() && c.built.elapsed() < MAX_CIRCUIT_AGE);
+        while open.len() >= MAX_CIRCUITS {
+            let oldest = open
+                .iter()
+                .min_by_key(|(_, c)| c.built)
+                .map(|(key, _)| *key)
+                .expect("the map is not empty");
+            if let Some(retired) = open.remove(&oldest) {
+                retired.circuit.close();
+            }
+        }
+        open.insert(
+            address.public_key,
+            PooledOnionCircuit {
+                circuit: circuit.clone(),
+                built: Instant::now(),
+            },
+        );
+        Ok(circuit)
+    }
+
+    fn discard_onion_circuit(&self, address: &OnionAddress) {
+        if let Some(retired) = self
+            .onion_circuits
+            .lock()
+            .unwrap()
+            .remove(&address.public_key)
+        {
+            retired.circuit.close();
+        }
+    }
+
+    /// The blinded key and subcredential for this address in the current time
+    /// period. Both change when the period turns over.
+    fn onion_keys(&self, address: &OnionAddress) -> io::Result<([u8; 32], [u8; 32])> {
+        let ring = self.hsdir_ring()?;
+        let blinded = ring.period.blinded_key(&address.public_key)?;
+        Ok((blinded, address.subcredential(&blinded)))
     }
 
     fn fetch_descriptor(

@@ -92,10 +92,6 @@ impl Digest {
         Self { ctx, output_len }
     }
 
-    pub fn output_len(&self) -> usize {
-        self.output_len
-    }
-
     pub fn update(&mut self, data: &[u8]) {
         let rc = unsafe { EVP_DigestUpdate(self.ctx, data.as_ptr() as *const c_void, data.len()) };
         assert_eq!(rc, 1, "EVP_DigestUpdate failed: {}", openssl_errors());
@@ -217,7 +213,6 @@ mod tests {
     #[test]
     fn running_sha3_digest() {
         let mut d = Digest::sha3_256();
-        assert_eq!(d.output_len(), 32);
         d.update(b"ab");
         assert_eq!(d.peek_prefix::<32>(), sha3_256(b"ab"));
         assert_eq!(d.peek_prefix::<20>(), sha3_256(b"ab")[..20]);

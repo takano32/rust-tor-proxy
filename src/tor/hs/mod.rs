@@ -10,6 +10,7 @@ pub mod blind;
 pub mod descriptor;
 pub mod hsdir;
 pub mod ntor;
+pub mod rendezvous;
 
 /// `INT_8(x)`: the eight-byte big-endian encoding rend-spec writes that way.
 /// Not to be confused with tor-spec's one-byte `INT8`.
@@ -159,6 +160,64 @@ mod live_tests {
         let cached = client.descriptor(&address).expect("cached descriptor");
         assert!(again.elapsed().as_secs() < 2, "descriptor should be cached");
         assert_eq!(cached.revision_counter, descriptor.revision_counter);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live check: the whole rendezvous dance, ending in an HTTP request to a
+    /// real onion service.
+    ///
+    /// Run with `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires network access to the Tor network"]
+    fn connects_to_a_real_onion_service() {
+        use std::io::{Read, Write};
+
+        crate::log::init();
+        let dir = std::env::temp_dir().join(format!("tor-onion-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let client = TorClient::bootstrap(dir.clone()).expect("bootstrap");
+        let address = OnionAddress::parse(TORPROJECT_ONION).expect("address");
+
+        let start = std::time::Instant::now();
+        let mut stream = client.connect_onion(&address, 80).expect("connect_onion");
+        println!(
+            "rendezvous established in {:.1}s",
+            start.elapsed().as_secs_f32()
+        );
+
+        stream
+            .write_all(
+                format!("GET / HTTP/1.0\r\nHost: {TORPROJECT_ONION}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&response);
+        println!("--- response ---\n{}", &text[..text.len().min(300)]);
+        assert!(text.starts_with("HTTP/1."), "not an HTTP response");
+        assert!(response.len() > 100, "response looks truncated");
+
+        // A second stream must ride the same rendezvous circuit.
+        let second = std::time::Instant::now();
+        let again = client.connect_onion(&address, 80).expect("second connect");
+        println!("second stream in {:.2}s", second.elapsed().as_secs_f32());
+        assert!(
+            second.elapsed().as_secs() < 20,
+            "the circuit should be reused"
+        );
+        again.close();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
