@@ -68,6 +68,9 @@ pub struct TorClient {
     /// thousands of microdescriptors that a client with no onion traffic
     /// never needs.
     hsdir_ring: Mutex<Option<Arc<HsdirRing>>>,
+    /// Held while the ring is being built, so that two `.onion` requests
+    /// arriving together do not both pay for it.
+    hsdir_build: Mutex<()>,
     /// Onion service descriptors, in memory only: they name the service's
     /// introduction points, which is not something to leave on disk.
     descriptors: Mutex<HashMap<[u8; 32], CachedDescriptor>>,
@@ -124,6 +127,7 @@ impl TorClient {
             circuits: Mutex::new(Vec::new()),
             microdescs: Mutex::new(HashMap::new()),
             hsdir_ring: Mutex::new(None),
+            hsdir_build: Mutex::new(()),
             descriptors: Mutex::new(HashMap::new()),
             onion_circuits: Mutex::new(HashMap::new()),
         };
@@ -580,10 +584,14 @@ impl TorClient {
     /// quick, and the ring itself is kept until the consensus changes.
     pub fn hsdir_ring(&self) -> io::Result<Arc<HsdirRing>> {
         let valid_after = self.directory.consensus.valid_after;
-        if let Some(ring) = self.hsdir_ring.lock().unwrap().as_ref() {
-            if ring.valid_after == valid_after {
-                return Ok(Arc::clone(ring));
-            }
+        if let Some(ring) = self.cached_hsdir_ring(valid_after) {
+            return Ok(ring);
+        }
+        // Thousands of directory requests is not something to do twice over,
+        // so whoever gets here first builds and the rest wait for it.
+        let _building = self.hsdir_build.lock().unwrap();
+        if let Some(ring) = self.cached_hsdir_ring(valid_after) {
+            return Ok(ring);
         }
 
         let started = Instant::now();
@@ -635,6 +643,15 @@ impl TorClient {
         });
         *self.hsdir_ring.lock().unwrap() = Some(Arc::clone(&ring));
         Ok(ring)
+    }
+
+    fn cached_hsdir_ring(&self, valid_after: u64) -> Option<Arc<HsdirRing>> {
+        self.hsdir_ring
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ring| ring.valid_after == valid_after)
+            .map(Arc::clone)
     }
 
     pub fn consensus_summary(&self) -> String {
@@ -782,13 +799,17 @@ impl TorClient {
                 retired.circuit.close();
             }
         }
-        open.insert(
+        // Another thread may have built one for this service while we were
+        // busy; whichever loses gets closed rather than left running.
+        if let Some(displaced) = open.insert(
             address.public_key,
             PooledOnionCircuit {
                 circuit: circuit.clone(),
                 built: Instant::now(),
             },
-        );
+        ) {
+            displaced.circuit.close();
+        }
         Ok(circuit)
     }
 
@@ -832,6 +853,9 @@ impl TorClient {
             }
             match self.fetch_descriptor_from(identity, &path, blinded, subcredential) {
                 Ok(descriptor) => return Ok(descriptor),
+                // We have the descriptor and it says the service wants client
+                // authorization. Every other copy says the same thing.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
                 Err(e) => {
                     crate::debug!("hsdir {}: {e}", hex_encode(&identity[..4]));
                     all_absent &= e.kind() == io::ErrorKind::NotFound;

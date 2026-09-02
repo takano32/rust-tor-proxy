@@ -126,6 +126,7 @@ fn establish_on(
 
     let mut last: Option<io::Error> = None;
     let mut all_unrecognized = true;
+    let mut attempts = 0usize;
     for index in order.into_iter().take(INTRO_ATTEMPTS) {
         if Instant::now() >= deadline {
             last = Some(io::Error::new(
@@ -135,6 +136,7 @@ fn establish_on(
             break;
         }
         let intro = &descriptor.intro_points[index];
+        attempts += 1;
         match introduce(
             client,
             circuit,
@@ -154,7 +156,9 @@ fn establish_on(
 
     let error = last.unwrap_or_else(|| invalid_data("the descriptor named no introduction points"));
     Err(Failure {
-        descriptor_is_stale: all_unrecognized,
+        // Only a rejection tells us the descriptor is stale. Running out of
+        // time before trying anything says nothing about it.
+        descriptor_is_stale: attempts > 0 && all_unrecognized,
         error,
     })
 }
