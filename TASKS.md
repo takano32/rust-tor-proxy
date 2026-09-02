@@ -893,3 +893,441 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
 8. **SOCKS5 のテストにあった既存の flake を直した**(第 II 部とは無関係)。
    拒否した要求の残りバイトを読まずにソケットを閉じると FIN ではなく RST が飛び、
    直前に書いた応答がクライアントに届く前に捨てられていた。4 回に 1 回失敗していた。
+
+---
+
+# 第 III 部 — 速くて手軽な常駐プロキシ 実装計画
+
+第 I・II 部の上に、**待ち時間とスループット**を本家並みに近づけ、**何も設定せずに動かし続けられる**
+ようにする。方針は「速くて手軽」。匿名性の強化(vanguards、ストリーム分離など)は本計画の
+対象外とし、現状の匿名性を大きく下げない範囲で速度を取る。
+
+---
+
+## 16. 背景と決定事項
+
+### 16.1 何が遅いか(2026-09-02 時点の実測と内訳)
+
+| 項目 | 実測 | 内訳 |
+|---|---|---|
+| 冷えた状態の bootstrap | 13〜27 秒 | フォールバックへ TLS → 非圧縮コンセンサス 3.6MB → 証明書 → ガードの microdesc → ガードへ TLS。TLS 2 本と、1 ホップ回路で 3.6MB を流す時間 |
+| ready 後の初回接続 | 未計測(数秒) | 要求が来てから microdesc 取得 1 往復、CREATE2 + EXTEND2 × 2 の 3 往復、BEGIN → CONNECTED の 1 往復。全部直列 |
+| 2 本目以降の接続 | 約 1 往復 | BEGIN → CONNECTED を待ってから SOCKS に応答している |
+| `.onion` 初回(冷) | 51 秒 | HSDir リング 38 秒(92 件 × 31 要求を直列)+ descriptor 取得の 3 ホップ回路 + RP 回路 + IP 回路(すべて直列) |
+| `.onion` 初回(温) | 13 秒 | 回路 3 本と INTRODUCE / RENDEZVOUS2 の往復が全部直列 |
+| スループット | 410KB/s | window 方式の上限 = 1000 セル × 498B ≈ 500KB / RTT。RTT 1 秒強の回路でちょうどこの値 |
+
+要するに、(1) 起動時に大きな文書を非圧縮で取る、(2) 何もかも要求が来てから直列に作る、
+(3) フロー制御が window/RTT で頭打ち、の 3 つ。第 III 部はこの順に潰す。
+
+また、常駐させると次の問題が出る(第 I・II 部の範囲外だったもの):
+
+- コンセンサスを起動時に 1 度しか取らない(`client.rs` の `Directory` は不変)。`valid-until`
+  (3 時間)を過ぎると古いリレー表で走り続け、翌日 12:00 UTC の time period 切替後は古い `A'`
+  を計算し続けて `.onion` が取れなくなる。
+- `state/microdescs/` を消す経路が無い。onion 1 回で 25MB、コンセンサスが替わるたびに増える。
+- ガードへの接続に 1 度失敗しただけで別のガードに乗り換え、失敗リストはプロセスが生きている間
+  戻らない。ネットワークが一瞬切れるとガードが替わる(ガード固定の目的を損なう)。
+
+### 16.2 決定事項
+
+1. **Listen は `0.0.0.0` のまま。接続数・帯域の上限、SOCKS 認証は付けない**。SOCKS5 の
+   user/pass(method 0x02)は「受理して読み捨てる」だけにし、資格情報によるストリーム分離も
+   しない(分離は回路の共有を減らすので遅くなる)。
+2. **設定項目は増やさない**。環境変数は `SERVER_PORT`、`TOR_STATE_DIR`、`TOR_LOG`、
+   `TOR_OPENSSL_*` の 4 系統のまま。`SERVER_PORT` は未設定なら 9050。調整値はすべて `const`。
+3. **依存ゼロは維持する**。zlib は OpenSSL と同じ方式で `libz.so.1` を dlopen する。
+   **無ければ非圧縮で動く**(警告 1 行のみ)。
+4. **速度のために回路を複数使う**。同時ストリームを複数回路に分散し、回路と 2 ホップの stub を
+   事前に作っておく。出口が増えるぶん匿名性は本家より下がる。README に明記する。
+5. **ntor-v3 と輻輳制御(FlowCtrl=2)を実装する**。理由は 2 つ: window の上限を外すのが
+   スループット改善の本命であること、および 2025 年半ばに FlowCtrl=1 が必須化された前例
+   (C Tor ReleaseNotes、bug 41191)があり、FlowCtrl=2 も必須化されうること。
+   2026-09-02 のコンセンサスは
+   `required-client-protocols Cons=2 Desc=2 FlowCtrl=1 Link=4 Microdesc=2 Relay=2`(現状で全部満たす)、
+   `recommended-client-protocols` に `FlowCtrl=1-2 Link=4-5 Relay=2-4`、
+   `required-relay-protocols` に `FlowCtrl=1-2 Relay=2-4`(= 全リレーが ntor-v3 と cc に対応済み)、
+   `params` に `cc_alg=2`(Vegas)と `UseOptimisticData=1`。
+6. **スレッドモデルは変えない**(`std::thread` + ブロッキング I/O)。バックグラウンドは
+   「保守スレッド 1 本」と「回路ビルダースレッド 1 本」、それに `.onion` 確立とディレクトリ
+   並列取得の短命スレッドだけ。
+7. **マイルストーンの順序は価値順**。M15(常駐)と M16(待ち時間)だけでも十分に価値があり、
+   M18〜M19(ntor-v3 と cc)は最後。
+
+### 16.3 対象外
+
+bridge と PT、conflux、CGO(2026 年時点で実験段階、既定無効)、onion service の PoW(解なしでも
+「努力ゼロ」の INTRODUCE1 として扱われるだけで拒否はされない)、リンク v5 とパディング交渉、
+vanguards-lite、IPv6 宛先、SOCKS の RESOLVE、onion service のサービス側とクライアント認証。
+匿名性の強化は第 IV 部があればそこで扱う。
+
+---
+
+## 17. アーキテクチャ(追加分)
+
+```
+src/
+  config.rs          (改修)SERVER_PORT の既定 9050
+  socks5.rs          (改修)先頭 1 バイトで SOCKS5 / SOCKS4a / HTTP CONNECT を振り分け、楽観応答
+  ffi/
+    zlib.rs          libz.so.1 を dlopen: inflate だけ。読めなければ None
+  tor/
+    maintain.rs      保守スレッド: コンセンサス更新、キャッシュ剪定、ガード再試行、リング先読み
+    pool.rs          回路プールとビルダースレッド: stub(2 ホップ)、clean、dirty、predicted ports
+    ntor_v3.rs       ntor-v3 ハンドシェイクと拡張フィールド(cc 要求 / 応答)
+    cc.rs            輻輳制御: cwnd、RTT、Vegas、XON/XOFF
+    circuit.rs       (改修)楽観送信(CONNECTED 前の DATA と再送バッファ)、
+                     フロー制御を enum { Window, Congestion } に、ntor-v3 での create / extend
+    client.rs        (改修)Directory を RwLock に、circuit_for を pool に委譲、connect_onion の並列化
+    dir/
+      fetch.rs       (改修)`.z` と Content-Encoding、1 回路に複数 BEGIN_DIR ストリームの並列 GET
+      diff.rs        consensus diff(ed 形式)の適用と SHA3-256 検証
+      mod.rs         (改修)refresh()、prune()
+    hs/
+      descriptor.rs  (改修)flow-control 行
+      rendezvous.rs  (改修)RP と IP の並列構築、cc 拡張付き INTRODUCE1
+```
+
+スレッドの追加分: 保守スレッド 1 本(常駐)、回路ビルダー 1 本(常駐)、`.onion` 確立時の
+RP 用 1 本(短命)、ディレクトリ並列取得の最大 4 本(短命)。
+
+---
+
+## 18. マイルストーン
+
+第 I・II 部と同じく、完了条件を満たしたらコミットし、§5 のメモリ検証、
+`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check` を通す。
+速度の完了条件は同じ回路でも揺れるので、**5 回計測の中央値**で判定する。
+M15 に着手する前に §20 の「現状」列の未計測項目を埋めておく(比較の基準になる)。
+
+### M15. 常駐化: コンセンサス更新、圧縮と diff、キャッシュ剪定、ガードの再試行
+
+- [x] **zlib FFI(`ffi/zlib.rs`)**: `libz.so.1` を `ffi/mod.rs` と同じ dlopen 方式で読む。
+      関数は `zlibVersion`、`inflateInit2_`、`inflate`、`inflateEnd` の 4 つ。
+  - `z_stream` は呼び出し側が確保する構造体なので **Rust 側に `#[repr(C)]` で同じレイアウトを書く**:
+    `next_in: *const u8, avail_in: c_uint, total_in: c_ulong, next_out: *mut u8, avail_out: c_uint,
+    total_out: c_ulong, msg: *const c_char, state: *mut c_void, zalloc: *const c_void,
+    zfree: *const c_void, opaque: *mut c_void, data_type: c_int, adler: c_ulong, reserved: c_ulong`
+    (LP64 で 112 バイト)。`inflateInit2_(strm, windowBits, zlibVersion(), sizeof(z_stream))` の
+    第 4 引数にこのサイズを渡す。合わなければ `Z_VERSION_ERROR(-6)` が返る。
+  - `windowBits = 47`(15 + 32、zlib / gzip 自動判別)。戻り値 `Z_OK=0`、`Z_STREAM_END=1`、
+    `Z_BUF_ERROR=-5`(出力バッファ不足、続行可)、それ以外はエラー。
+  - `inflate_all(data, max_out) -> io::Result<Vec<u8>>`。出力は `MAX_RESPONSE_BYTES` で打ち切る
+    (圧縮爆弾対策)。
+  - 読めなかった場合は `None` を返し、呼び出し側は非圧縮で要求する。起動時に 1 行ログ。
+- [x] **ディレクトリ要求の圧縮(`fetch.rs`)**: zlib が使えるとき URL に `.z` を付ける
+      (dir-spec: `.z` = zlib 圧縮、応答は `Content-Encoding: deflate`)。応答ヘッダの
+      `Content-Encoding` が `deflate` なら inflate、`identity` または無しならそのまま。
+      コンセンサス、鍵証明書、microdesc、onion descriptor のすべてに適用する。
+- [x] **ディレクトリ要求の並列化(`fetch.rs`, `dir/mod.rs`)**: `stream_microdescs` の
+      バッチを 1 本の 1 ホップ回路の上で **BEGIN_DIR ストリーム 4 本**に分けて同時に取る
+      (`Circuit` は複数ストリームを扱えるので、スレッド 4 本で `fetch::get` を呼ぶだけ)。
+      主な対象は HSDir リング構築の 31 バッチ。
+- [x] **consensus diff(`dir/diff.rs`)**: 手元のコンセンサス本文の SHA3-256 を
+      `X-Or-Diff-From-Consensus: <hex>` ヘッダで送る。応答が `network-status-diff-version 1` で
+      始まれば diff、`network-status-version` で始まれば全文。
+  - 2 行目 `hash <from> <to>`: `from` が手元の SHA3-256 と一致しなければ捨てて全文取得。
+  - 本体は ed 形式のサブセット: `Nd`、`N,Md`、`Na`、`Nc`、`N,Mc`(`$` は末尾)。`a` / `c` の
+    挿入行は単独の `.` 行まで。**コマンドは行番号の降順に並ぶ**ので、前から順に適用しても
+    番号がずれない。
+  - 適用結果の SHA3-256 が `to` と一致し、かつ従来どおり署名検証に通ったときだけ採用する。
+    どちらかが失敗したら全文取得にフォールバックし、`warn` を出す。
+  - 手元の本文は `state/consensus` から読む(メモリには本文を持たない方針のまま)。
+    適用中だけ旧本文 + 新本文の約 7MB を持つ。
+  - 単体テスト: 小さな文書に対する d / a / c と降順適用、`hash` 不一致の拒否。
+- [x] **保守スレッド(`tor/maintain.rs`)**: bootstrap 後に 1 本起動し、次を回す。
+  1. **コンセンサス更新**: `fresh-until` から `(valid-until − fresh-until) × 3/4` の区間に
+     一様乱数で時刻を決めて取得する(正確な式は dir-spec/client-operation.md を正とする)。
+     経路は既存 `dir_circuit()`(ガードへの 1 ホップ)。失敗は 5 分後から倍々で最大 30 分まで
+     再試行。`valid-until` を過ぎても手元のものを使い続ける(C Tor も 24 時間までは使う)が、
+     毎分再試行する。
+  2. 取得後、`parse_and_verify` → `Directory` を `RwLock` で差し替える。新しい署名鍵が要れば
+     `/tor/keys/fp-sk/` を追加取得(既存 `fetch`)。差し替え時に: HSDir リング(`valid_after`
+     が変わるので必ず)と onion descriptor(period が変われば)を無効化、microdesc の
+     メモリキャッシュは digest 単位で有効なので残す、回路プールもそのまま。
+  3. **キャッシュ剪定**: 差し替え直後に `state/microdescs/` を走査し、新コンセンサスの `m`
+     行に無い digest のファイルを削除する。`*.tmp` も消す。
+  4. **HSDir リングの先読み**: 差し替え後(および起動直後、M16 の stub 作成の後)に
+     `hsdir_ring()` をバックグラウンドで呼ぶ。2 回目以降は差分の microdesc だけなので数秒。
+  5. **ガードの再試行**(下記)。
+  `Directory` の読み手(`client.rs` の `router()` など)は `RwLock` の read ガードを短く取る
+  (回路構築の間じゅう握らない)。
+- [x] **ガードの再試行(`client.rs`)**: 失敗しても即座に忘れない。
+  - `state/guard` を `state/guards` にし、最大 3 台を優先順で保存する(先頭が primary)。
+  - ガードへの接続失敗時: フォールバック 2 台に TCP 接続できるか調べ、どちらも駄目なら
+    「こちらが断」と判断してガードは変えず失敗を返す(保守スレッドが 30 秒後に再接続する)。
+    つながればガードが落ちていると判断し、`failed_at` を記録して次の候補へ。
+  - 保守スレッドは `failed_at` から 10 分ごとに primary へ再接続を試み、成功したら以降の
+    新規回路は primary に戻す(既存回路はそのまま)。
+  - 新しいコンセンサスに primary が無ければ次点へ。Running が無いだけなら試し続ける。
+- [x] **bootstrap の短縮**: `state/guards` があるときは、フォールバックではなく **ガードに
+      直接つないでコンセンサスを取る**(TLS が 1 本減る)。コンセンサスは `.z` + diff。
+- [x] 単体テスト: diff 適用、剪定(ダミーのファイル)、更新時刻の乱数が区間内、ガードの状態遷移。
+- 完了条件: 冷えた状態の bootstrap が **10 秒以内**(現状 13〜27 秒)。`TOR_LOG=info` で
+  4 時間以上動かし、コンセンサスが diff で更新された行と剪定の行がログに出る。
+  翌日(12:00 UTC 以降)も再起動なしで `.onion` に接続できる。`state/` の容量が増え続けない。
+
+### M16. 待ち時間ゼロ化: 事前構築、並列化、楽観応答
+
+- [ ] **回路プールとビルダースレッド(`tor/pool.rs`)**: 現在 `client.rs` にある
+      `circuits` / `onion_circuits` の管理をここへ移す。
+  - **stub**: guard → middle の 2 ホップ回路。常に 2 本用意する。要求が来たら stub を取り、
+    最後の 1 ホップ(exit / HSDir / IP / RP)だけ EXTEND2 する。middle が最後のホップと同一の
+    identity・/16・family なら stub を捨てて別のものを使う(`PathConstraints::accepts`)。
+    これで通常の新規回路は「往復 3 回」が「往復 1 回」になる。
+  - **clean 回路**: predicted ports(直近 60 分に使ったポート。起動時は {80, 443})を
+    すべて許す exit で完成させた 3 ホップ回路を常に 1 本用意する。初回接続は BEGIN の 1 往復だけ。
+  - **dirty 回路**: 使用中。dirtiness は **初回使用から** 10 分(現状は構築時から)。
+  - ビルダーは `Condvar` で起こす(プールが減ったとき、コンセンサス差し替え、30 秒周期)。
+    合計は `MAX_CIRCUITS`(8)のまま。stub を作れない(ガード断)ときは指数バックオフ。
+- [ ] **ストリームの分散**: 新しいストリームは「ポートを許す回路のうち開いているストリームが
+      最少のもの」に載せる。最少が 4 以上で上限未満なら stub から新しい回路を作り、以後の
+      ストリームをそちらへ。window 方式では回路ごとに 1000 セル / RTT の上限があるので、
+      並列ダウンロードの合計が回路数に比例して伸びる。
+- [ ] **楽観応答(optimistic data)**(`circuit.rs`, `socks5.rs`): コンセンサスは
+      `UseOptimisticData=1`。tor-spec/opening-streams.md のとおり、CONNECTED を待たずに
+      RELAY_DATA を送ってよい。
+  - `Circuit::begin_stream` を「BEGIN を送ったら即 `TorStream` を返す」に変え、
+    `TorStream` に状態 `Connecting | Connected | Ended(reason)` を持たせる。
+    `write` は Connecting でも送る。`read` は Connected になるまで待つ。
+  - SOCKS 側は **BEGIN を送った直後に成功応答を返す**。クライアント(curl の TLS ClientHello
+    など)のバイトはそのまま RELAY_DATA になる。接続ごとに 1 往復減る。
+  - **再送バッファ**: CONNECTED 前に送ったバイトは 16KB まで控える。CONNECTED 前に END が
+    来て理由が `EXITPOLICY`(または回路自体の破棄)なら、別の回路で BEGIN からやり直して
+    控えたバイトを再送する(C Tor の `pending_optimistic_data` と同じ)。
+    `RESOLVEFAILED` / `CONNECTREFUSED` は宛先の問題なので再試行せず SOCKS 接続を閉じる。
+    16KB を超えていたら再試行せず閉じる。
+  - 失敗が SOCKS の応答コードでなく切断で見えるようになるので、END の理由を `info` で出す。
+  - rendezvous 回路でも同じにする。サービス側が CONNECTED 前の DATA を受けなかった場合は
+    実機で分かるので、そのときは onion だけ CONNECTED 待ちに戻す。
+- [ ] **TCP_NODELAY**: ガードチャネルの `TcpStream` と SOCKS クライアントの `TcpStream` に
+      `set_nodelay(true)`。セル 1 個(514 バイト)の書き込みが Nagle で遅延しないようにする。
+- [ ] **`.onion` の並列化(`rendezvous.rs`, `client.rs`)**:
+  - RP 回路(stub から 1 ホップ + ESTABLISH_RENDEZVOUS)を別スレッドで作りながら、
+    呼び出し元スレッドで IP 回路(stub から 1 ホップ)を作る。INTRODUCE1 は
+    **RENDEZVOUS_ESTABLISHED を受けてから**送る(先に送るとサービスが RP に来たとき cookie が
+    無く、RENDEZVOUS1 が捨てられる)。
+  - descriptor は担当 HSDir 2 台に同時に要求し、先に返った方を採る(stub 2 本消費)。
+    もう一方の回路は閉じる。
+  - リングは M15 で先読み済みなので、冷えた状態でも待つのは descriptor + RP / IP の分だけ。
+- [ ] **bandwidth-weights(`consensus.rs`, `path.rs`)**: `bandwidth-weights` 行を
+      `Params` と同様に読み、guard / middle / exit の位置ごとに `Wgg Wgm Wgd Wmg Wmm Wme Wmd
+      Wee Wem Wed`(単位 1/10000)を掛けて `weighted_choice` する。速度には中立だが
+      `path.rs` の TODO を解消し、本家と同じ分布になる。dir-spec/consensus-formats.md の
+      bandwidth-weights と path-spec の重み付けの節を正とする。
+- [ ] 単体テスト: プールの状態遷移(stub 消費と補充、predicted ports の更新)、
+      楽観送信の再送バッファ(CONNECTED 前 END → 再送、上限超過 → 閉じる)、
+      ストリーム分散の選択規則、bandwidth-weights の適用。
+- 完了条件(5 回の中央値): ready 後の初回 `curl https://check.torproject.org/api/ip` の
+  `time_starttransfer` が **2 秒以内**。2 本目以降は `time_appconnect`(TLS 確立)が現状より
+  約 1 往復(0.3〜1 秒)短い。`.onion` 初回が冷えた状態で **20 秒以内**、温かい状態で
+  **8 秒以内**、2 回目は現状どおり 1 秒台。4 並列の 2MB ダウンロードの合計スループットが
+  単一の **3 倍以上**。
+
+### M17. SOCKS の手軽さ: SOCKS4a、HTTP CONNECT、既定ポート
+
+- [ ] **先頭 1 バイトで振り分け(`socks5.rs`)**: `0x05` → SOCKS5(既存)、`0x04` → SOCKS4 / 4a、
+      ASCII 大文字(`A`〜`Z`)→ HTTP。それ以外は切断。
+- [ ] **SOCKS4a**: `VN=4 | CD=1 | DSTPORT(2) | DSTIP(4) | USERID… NUL`、DSTIP が `0.0.0.x`
+      (x ≠ 0)なら続けて `HOST… NUL`(4a)。応答 `VN=0 | CD=90(許可)/ 91(拒否) | DSTPORT(2) | DSTIP(4)`。
+      `.onion` も同じ経路。proxychains の既定設定(`socks4 127.0.0.1 9050`)がそのまま通る。
+- [ ] **HTTP CONNECT**: `CONNECT host:port HTTP/1.x` の 1 行と空行までのヘッダを読み、
+      `HTTP/1.1 200 Connection established\r\n\r\n` を返して以後トンネル。CONNECT 以外の
+      メソッド(絶対 URI の GET など、`http_proxy` で平文 HTTP を通そうとした場合)は
+      `HTTP/1.1 501` と「use socks5h://」の本文で断る。`https_proxy=http://127.0.0.1:9050`
+      の curl が通る。
+- [ ] **SOCKS5 の method 0x02**: `0x00` が無く `0x02` だけを申し出るクライアントも受理し、
+      RFC 1929 の `01 ULEN UNAME PLEN PASSWD` を読み捨てて `01 00` を返す。資格情報は使わない。
+- [ ] **`SERVER_PORT` の既定を 9050 に**(`config.rs`)。未設定でも動く。
+- [ ] 楽観応答(M16)を 3 つの入口すべてに適用する。
+- [ ] 単体テスト: 振り分け、SOCKS4a の解析と応答、CONNECT の解析と 501、method 0x02 の読み捨て。
+- 完了条件: `proxychains -q curl https://check.torproject.org/api/ip`(既定 conf)、
+  `https_proxy=http://127.0.0.1:9050 curl …`、`curl --socks5-hostname …` の 3 つで `"IsTor":true`。
+
+### M18. ntor-v3(`tor/ntor_v3.rs`, `circuit.rs`)
+
+輻輳制御の前提。この段階では拡張フィールドを空にして送り、フロー制御は window 方式のまま。
+tor-spec/create-created-cells.md の ntor-v3 節(proposal 332)を正とする。
+
+- [ ] CREATE2 / EXTEND2 の `HTYPE = 0x0003`。`ID` は **リレーの Ed25519 識別子**(microdesc の
+      `id ed25519`。無いリレーには従来の ntor を使う)、`B` は `ntor-onion-key`。
+- [ ] 記法: `ENCAP(s) = INT_8(len(s)) | s`(8 バイト big-endian、`hs::int8` と同じ)、
+      `H(s, t) = SHA3_256(ENCAP(t) | s)`、`MAC(k, msg, t) = SHA3_256(ENCAP(t) | ENCAP(k) | msg)`、
+      `KDF(s, t) = SHAKE_256(ENCAP(t) | s)`、`ENC(k, m) = AES_256_CTR(k, m)`(IV 0)。
+      `PROTOID = "ntor3-curve25519-sha3_256-1"`。tweak は `PROTOID | ":kdf_phase1"`、
+      `":msg_mac"`、`":key_seed"`、`":verify"`、`":kdf_final"`、`":auth_final"`。
+      検証文字列 `VER = "circuit create"`(arti の `NTOR3_CIRC_VERIFICATION`)。
+- [ ] クライアント側(送信):
+  - `x, X` を生成、`Bx = EXP(B, x)`。
+  - `phase1 = KDF(Bx | ID | X | B | PROTOID | ENCAP(VER), t_msgkdf)` → `ENC_K1(32) | MAC_K1(32)`。
+  - `CM`(クライアントメッセージ)= 拡張フィールド列 `N_EXT(1) | {TYPE(1) LEN(1) BODY}*`。
+    M18 では `N_EXT = 0`。
+  - `encrypted = ENC(ENC_K1, CM)`、`mac = MAC(MAC_K1, ID | B | X | encrypted, t_msgmac)`。
+  - HDATA = `ID(32) | B(32) | X(32) | encrypted | mac(32)`。
+- [ ] クライアント側(受信 `Y(32) | AUTH(32) | encrypted_reply`):
+  - `secret_input = EXP(Y, x) | Bx | ID | B | X | Y | PROTOID | ENCAP(VER)`。
+  - `ntor_key_seed = H(secret_input, t_key_seed)`、`verify = H(secret_input, t_verify)`。
+  - `KDF(ntor_key_seed, t_final)` の先頭から `ENC_KEY(32)` を取り、残りが回路鍵の
+    キーストリーム(`Df(20) | Db(20) | Kf(16) | Kb(16)`。tor1 のリレー暗号は従来どおり)。
+  - `auth_input = verify | ID | B | Y | X | mac | ENCAP(encrypted_reply) | PROTOID | "Server"`、
+    `AUTH == H(auth_input, t_auth)` を定数時間比較。
+  - `SM = DEC(ENC_KEY, encrypted_reply)` を拡張フィールドとして解析する(M19 で使う)。
+  - **連結順は上の記述より仕様と C Tor `src/core/crypto/onion_ntor_v3.c` を優先**し、
+    テストベクタで固定する。
+- [ ] `NtorClient` と同じ形の `NtorV3Client::new(id, b) / onion_skin(exts) / finish(reply) -> (CircuitKeys, Vec<Ext>)`。
+      `Circuit::create` / `extend` は `RelayInfo.ed_identity` があれば ntor-v3、無ければ ntor。
+      ディレクトリ用の 1 ホップは CREATE_FAST のまま。
+- [ ] 単体テスト: C Tor `src/test/` の ntor-v3 テスト(`test_ntor_v3.c` 相当。`grep -rl ntor3 src/test/`)
+      と arti `tor-proto` の `ntor_v3.rs` にある固定ベクタ(鍵と乱数を固定した往復)。無ければ
+      第 II 部の hs-ntor と同様に、テスト内にサーバ側を書いて往復させる。
+- 完了条件: 3 ホップすべて ntor-v3 で `https://check.torproject.org/api/ip` が `"IsTor":true`。
+  既存の実機テスト 7 件が退行しない。
+
+### M19. 輻輳制御(`tor/cc.rs`, `circuit.rs`, `hs/`)
+
+proposal 324(`324-rtt-congestion-control.txt`)と param-spec.md の `cc_*` を正とする。
+C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
+
+- [ ] **交渉**: 終端ホップ(exit、または onion service)との ntor-v3 に拡張 `TYPE=01`
+      (cc 要求、本体なし)を入れる。応答の `TYPE=02` の本体 `sendme_inc(1)` を採用する
+      (現在 31)。応答が無ければその回路は window 方式。**中間ホップとは交渉しない**。
+- [ ] **回路ごとのフロー制御を `enum FlowControl { Window(既存), Congestion(cc::State) }`** にし、
+      受信・送信処理を分岐する。
+- [ ] **受信側**: `sendme_inc` セルごとに SENDME(version 1、digest 付き。形式は既存)を送る。
+      100 個ごとの回路 window と 50 個ごとのストリーム window は使わない。
+      **周期がずれると相手が回路を切る**ので、カウントは既存の受信ダイジェスト処理と同じ場所で行う。
+- [ ] **送信側**: `inflight = sent − acked`。SENDME 1 個 = `sendme_inc` セルの ACK。
+      `inflight < cwnd` のときだけ送る(既存の package window 待ちと同じ Condvar)。
+  - RTT: 送信セルの通し番号が `sendme_inc` の倍数になるたびに `Instant` を控え、対応する
+    SENDME が来たら差を取る。`min_rtt` と EWMA(`cc_ewma_cwnd_pct`、上限 `cc_ewma_max`)を持つ。
+    時計の停止・逆行は無視する。
+  - BDP: `bdp = cwnd × min_rtt / ewma_rtt`(cwnd 方式。C Tor はこの推定器だけを残している)。
+  - Vegas(`cc_alg=2`): SENDME ごとに `queue_use = cwnd − bdp` を計算する。
+    slow start 中は `queue_use < gamma` かつ `cwnd < ss_cap` なら `cwnd` を増やし
+    (`cc_cwnd_inc_pct_ss`)、超えたら slow start を抜けて `cwnd = bdp + gamma`。
+    通常時は `queue_use > delta` なら `cwnd = bdp + delta − cwnd_inc`、`> beta` なら
+    `−cwnd_inc`、`< alpha` なら `+cwnd_inc`(更新は `cc_cwnd_inc_rate` SENDME に 1 回)。
+    **cwnd を使い切っていない周期では増やさない**(`cc_cwnd_full_gap` / `cc_cwnd_full_minpct`)。
+    常に `cwnd >= cc_cwnd_min`。**この段落の式は要旨であり、実装は proposal 324 §3.3 と
+    `congestion_control_vegas.c` に合わせる**。
+  - パラメータは exit 回路には `*_exit`、onion 回路には `*_onion` を使う。既定値は
+    param-spec.md、コンセンサス `params` にあればそれを使う(`Params` に追加)。
+- [ ] **ストリームのフロー制御 XON/XOFF**: `RELAY_XOFF = 43`(本体 `version(1)=0`)、
+      `RELAY_XON = 44`(本体 `version(1)=0 | kbps_ewma(4)`)。
+  - 受信: 相手からの XOFF でそのストリームの送信を止め、XON で再開する(`TorStream::write` の待ち)。
+  - 送信: ストリームの未読バッファが `cc_xoff_client` セル分を超えたら XOFF、
+    半分以下に減ったら XON(`kbps_ewma` は 0 = 制限なしでよい)。既存の
+    「アプリが読み切ってから SENDME」の仕組みを XON/XOFF に置き換える。
+- [ ] **onion service**: descriptor 内層の `flow-control <range> <sendme_inc>` 行を読む
+      (`descriptor.rs`)。range が `2` を含むなら INTRODUCE1 の暗号化部の拡張に `TYPE=01`
+      (cc 要求)を入れ、仮想ホップを `Congestion` にする(`sendme_inc` は descriptor の値)。
+      無ければ window。
+- [ ] 単体テスト: cc の状態機械を「相手役」を書いて回す(SENDME の周期、cwnd の増減、
+      XOFF で止まり XON で再開、`inflight` の上限)。RTT は `Instant` を注入できる形にして
+      決定的にする。
+- 完了条件: 単一ストリームの 10MB ダウンロード(5 回の中央値)が window 方式の **2 倍以上**。
+  `.onion` の 10MB も同様に速くなる。既存の実機テストが退行しない。
+  cc の回路で 1 時間の連続ダウンロードが `DESTROY` なしに完走する(周期ずれの検出)。
+
+### M20. 仕上げ
+
+- [ ] README: 計測表を更新する(§20 の項目)。Limitations に「複数回路に分散するので出口が増える」
+      「楽観応答により失敗が SOCKS コードでなく切断で見える」を追記。「Not implemented」から
+      「congestion control」「consensus diffs or compression」を外す。SOCKS4a と HTTP CONNECT の
+      使い方、`SERVER_PORT` の既定を追記。
+- [ ] `TASKS.md` §0.2 の決定事項 4 と §1 の非ゴールを第 III 部の結果に同期する。
+      末尾に「§23 実装状況(第 III 部)」を第 I・II 部と同じ形式で書く。
+- [ ] `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、§5 のメモリ検証。
+      実行時 VmHWM は **35MB 未満**を維持する(現状 26.5MB + 常駐回路 3 本 + zlib)。
+- 完了条件: README の表がすべて実測で埋まっている。
+
+---
+
+## 19. FFI 関数一覧(追加分)
+
+`libz.so.1`(dlopen、無くても動く): `zlibVersion`, `inflateInit2_`, `inflate`, `inflateEnd`。
+定数: `Z_OK=0`, `Z_STREAM_END=1`, `Z_NEED_DICT=2`, `Z_DATA_ERROR=-3`, `Z_MEM_ERROR=-4`,
+`Z_BUF_ERROR=-5`, `Z_VERSION_ERROR=-6`, `Z_NO_FLUSH=0`, `windowBits=47`。
+
+OpenSSL の追加はなし(SHA3-256、SHAKE-256、AES-256-CTR、X25519 は第 II 部までで揃っている)。
+
+---
+
+## 20. 計測(README に載せる項目)
+
+すべて 5 回の中央値。`curl -w '%{time_appconnect} %{time_starttransfer} %{speed_download}\n'` を使う。
+
+| 項目 | 現状(第 II 部完了時) | 目標 |
+|---|---|---|
+| 冷えた bootstrap → listening | 13〜27 秒 | 10 秒以内(M15) |
+| 温かい bootstrap(live consensus あり) | ほぼ 0 | 変わらず |
+| ready 後の初回接続: 先頭バイトまで | 未計測(数秒) | 2 秒以内(M16) |
+| 2 本目以降: TLS 確立まで | 未計測 | 現状より約 1 往復短い(M16) |
+| `.onion` 初回(冷 / 温) | 51 秒 / 13 秒 | 20 秒 / 8 秒(M16) |
+| `.onion` 2 回目 | 1.2 秒 | 1 秒台 |
+| 単一ストリーム 10MB | 410KB/s 相当 | 2 倍以上(M19) |
+| 4 並列 2MB の合計 | 未計測 | 単一の 3 倍以上(M16) |
+| 4 時間連続稼働後のコンセンサス更新 | 無し | diff で更新される(M15) |
+| VmHWM | 26.5MB | 35MB 未満 |
+| `state/` の容量 | 増え続ける | コンセンサス 1 本ぶんで安定(M15) |
+
+```sh
+SERVER_PORT=9050 TOR_LOG=info ./target/release/rust-tor-proxy &
+sleep 30
+# 初回と 2 回目
+for i in 1 2; do curl -s --socks5-hostname 127.0.0.1:9050 -o /dev/null \
+  -w '%{time_appconnect} %{time_starttransfer} %{speed_download}\n' https://check.torproject.org/api/ip; done
+# 4 並列(2MB ずつ。大きなファイルを置いている任意の HTTPS サイトで)
+for i in 1 2 3 4; do curl -s --socks5-hostname 127.0.0.1:9050 -o /dev/null -r 0-2000000 \
+  -w '%{speed_download}\n' https://<大きなファイル>/ & done; wait
+# onion
+curl -s --socks5-hostname 127.0.0.1:9050 -o /dev/null -w '%{time_starttransfer}\n' \
+  http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/
+grep -E 'VmHWM' /proc/$!/status; du -sh state
+```
+
+---
+
+## 21. 仕様の参照先(追加分)
+
+| トピック | 場所 |
+|---|---|
+| 圧縮(`.z`、`Content-Encoding`)と consensus diff | dir-spec 配下。`grep -rl 'network-status-diff-version' spec/`、`grep -rl 'X-Or-Diff-From-Consensus' spec/` |
+| クライアントの取得タイミング | dir-spec/client-operation.md |
+| bandwidth-weights | dir-spec/consensus-formats.md、path-spec(`grep -rl Wgg spec/`) |
+| 楽観送信 | tor-spec/opening-streams.md(`grep -rn -i optimistic spec/tor-spec/`) |
+| ntor-v3 | tor-spec/create-created-cells.md の ntor-v3 節、proposals/332-ntor-v3-with-extra-data.md |
+| 輻輳制御、XON/XOFF、cc 拡張 | proposals/324-rtt-congestion-control.txt、tor-spec/flow-control.md、param-spec.md(`cc_*`) |
+| onion service の flow-control 行と INTRODUCE1 拡張 | rend-spec(`grep -rn 'flow-control' spec/rend-spec/`) |
+| SOCKS4a / SOCKS5 の Tor 拡張 | socks-extensions.md |
+| zlib | zlib.h(`inflateInit2_` の引数と `z_stream`) |
+
+参考実装: C Tor `src/feature/dircommon/consdiff.c`(diff 適用)、`src/core/or/circuituse.c`
+(predicted ports と事前構築)、`src/core/or/connection_edge.c`(optimistic data)、
+`src/core/crypto/onion_ntor_v3.c`、`src/core/or/congestion_control_*.c`、
+`src/feature/client/entrynodes.c`(ガードの再試行)。arti では `tor-consdiff`(diff)、
+`tor-proto` の `ntor_v3.rs` と `congestion/`、`tor-circmgr`(事前構築)。
+
+---
+
+## 22. 既知のリスクと対処(追加分)
+
+- **楽観応答で失敗が見えにくい**: 出口が拒否したときクライアントには切断として見える。
+  END の理由を `info` でログに出し、再送バッファで `EXITPOLICY` は別回路にやり直す。
+- **複数回路への分散は匿名性を下げる**: 同時に複数の出口が使われる。README に明記し、
+  分散のしきい値(4 ストリーム)は定数にする。
+- **zlib の `z_stream` レイアウト**: 合わないと `Z_VERSION_ERROR` か即クラッシュ。
+  起動時に `zlibVersion()` をログに出し、`inflateInit2_` の戻り値を必ず検査する。
+  aarch64 / x86_64 の LP64 のみ対象(第 I 部と同じ)。
+- **diff の適用ミス**: 結果の SHA3-256 と署名検証の二重チェックで検出し、全文取得に戻す。
+- **ガードの再試行と乗り換えの境界**: 「こちらが断」の判定をフォールバックへの TCP 接続で
+  行うので、フォールバック側が落ちていると誤判定してガードを替えてしまう。2 台に当たる。
+- **cc の周期ずれ**: SENDME の周期を間違えると終端が回路を破棄する(DESTROY)。
+  1 時間の連続ダウンロードを完了条件に入れる。
+- **cc のパラメータ既定値**: コンセンサスに無いときの既定値は param-spec.md の値を使い、
+  範囲外は既定に戻す(`Params::parse` の方針と同じ)。
+- **ntor-v3 の連結順**: 本書の式は要旨。テストベクタが通るまで実機にはつながない。
+- **サービス側が楽観送信に非対応の可能性**: rendezvous 回路で CONNECTED 前の DATA が
+  捨てられるなら、onion だけ CONNECTED 待ちに戻す(M16 の完了条件で確認)。
+- **メモリ**: 常駐回路 3 本と zlib、diff 適用中の本文 2 つぶんで数 MB 増える。
+  目標 35MB 未満、上限 60MB は第 I 部のまま。

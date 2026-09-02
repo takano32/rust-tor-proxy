@@ -179,6 +179,10 @@ pub struct KeyCertificate {
     /// SHA-1 of the DER signing key: matches a `directory-signature` line.
     pub signing_key_digest: [u8; 20],
     pub signing_key: RsaPublicKey,
+    /// The document this was parsed from, so that a set of certificates can be
+    /// written back to the cache without re-fetching it. Around 1.5kB each,
+    /// and there are never more than a couple of dozen.
+    pub text: String,
 }
 
 impl KeyCertificate {
@@ -248,8 +252,33 @@ impl KeyCertificate {
             v3ident,
             signing_key_digest,
             signing_key,
+            text: text.to_string(),
         })
     }
+
+    /// Whether this certificate is the one a `directory-signature` line names.
+    pub fn matches(&self, v3ident: &[u8; 20], signing_key_digest: &[u8; 20]) -> bool {
+        &self.v3ident == v3ident && &self.signing_key_digest == signing_key_digest
+    }
+}
+
+/// Write a set of certificates back out as one document, dropping repeats.
+///
+/// Refreshing a consensus adds whichever signing keys have rotated; without
+/// this the cache file would grow by the whole response every time.
+pub fn serialize(certs: &[KeyCertificate]) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<([u8; 20], [u8; 20])> = Vec::new();
+    for cert in certs {
+        let key = (cert.v3ident, cert.signing_key_digest);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push_str(cert.text.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// Parse every certificate in a `/tor/keys/...` response, keeping the ones

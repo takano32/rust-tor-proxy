@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use super::certs::now_unix;
@@ -19,7 +20,7 @@ use super::circuit::{self, Circuit, TorStream};
 use super::dir::cache::Cache;
 use super::dir::consensus::{RouterStatus, FLAG_HSDIR};
 use super::dir::microdesc::Microdesc;
-use super::dir::{DirCircuit, Directory};
+use super::dir::{fallback, DirCircuit, Directory};
 use super::hs::address::OnionAddress;
 use super::hs::blind::TimePeriod;
 use super::hs::descriptor::{self, Descriptor};
@@ -54,14 +55,31 @@ const GUARD_ATTEMPTS: usize = 5;
 /// the rest are worth trying too (rend-spec's time-period boundary case).
 const HSDIR_TRIES: usize = 3;
 
-const GUARD_FILE: &str = "guard";
+/// Where the chosen guards are remembered between runs, newest choice last.
+const GUARDS_FILE: &str = "guards";
+/// The single-guard file written by earlier versions, read once and replaced.
+const LEGACY_GUARD_FILE: &str = "guard";
+/// How many guards to keep on the list. Pinning one relay is what guards are
+/// for; a short ordered list only says which to fall back to while the first
+/// is unreachable, and the first is resumed as soon as it answers again.
+const MAX_GUARDS: usize = 3;
+/// How long a guard that refused a connection is left alone before it is
+/// tried again.
+pub const GUARD_RETRY_INTERVAL: Duration = Duration::from_secs(600);
+/// How long to wait for the TCP handshake when checking whether it is the
+/// network that is down rather than the guard.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many fallback mirrors that check tries before concluding we are cut
+/// off. Two, because one of them may simply be down.
+const REACHABILITY_PROBES: usize = 2;
 
 pub struct TorClient {
-    directory: Directory,
+    /// Swapped wholesale when the maintenance thread verifies a newer
+    /// consensus. Readers take a clone of the `Arc` and let go of the lock at
+    /// once, so a refresh never waits on a circuit being built.
+    directory: RwLock<Arc<Directory>>,
     state_dir: PathBuf,
-    guard: Mutex<Option<GuardState>>,
-    /// Guards that would not accept a connection, so we stop choosing them.
-    failed_guards: Mutex<Vec<[u8; 20]>>,
+    guards: Mutex<Guards>,
     circuits: Mutex<Vec<PooledCircuit>>,
     microdescs: Mutex<HashMap<[u8; 32], Arc<Microdesc>>>,
     /// Built the first time a `.onion` address is asked for, because it costs
@@ -71,6 +89,10 @@ pub struct TorClient {
     /// Held while the ring is being built, so that two `.onion` requests
     /// arriving together do not both pay for it.
     hsdir_build: Mutex<()>,
+    /// Set once a `.onion` request has needed the ring. Only then is it worth
+    /// the maintenance thread rebuilding it after a consensus change; a client
+    /// that never touches onion services should never pay for one.
+    hsdir_wanted: AtomicBool,
     /// Onion service descriptors, in memory only: they name the service's
     /// introduction points, which is not something to leave on disk.
     descriptors: Mutex<HashMap<[u8; 32], CachedDescriptor>>,
@@ -102,10 +124,109 @@ pub struct HsdirRing {
     spread_fetch: usize,
 }
 
-struct GuardState {
-    relay: RelayInfo,
+/// The guard list and the one channel currently open to a guard.
+struct Guards {
+    /// In priority order: the first entry is the primary, and the client goes
+    /// back to it as soon as it will talk to us again.
+    entries: Vec<GuardEntry>,
+    open: Option<OpenGuard>,
+}
+
+struct GuardEntry {
     identity: [u8; 20],
-    channel: Option<Channel>,
+    /// Where it was last reached, remembered across restarts so that the very
+    /// first thing a new process does can be to reconnect to its guard --
+    /// before it has a consensus to look the address up in.
+    contact: Option<GuardContact>,
+    /// When it last refused a connection that we are confident was its fault
+    /// rather than ours. `None` means it is believed good.
+    failed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct GuardContact {
+    addr: SocketAddrV4,
+    /// `KP_relayid_ed`, so the channel can be authenticated straight away.
+    ed_identity: [u8; 32],
+}
+
+struct OpenGuard {
+    identity: [u8; 20],
+    /// Filled in once the consensus and the guard's microdescriptor are to
+    /// hand: a channel needs only an address, but CREATE2 needs the onion key.
+    relay: Option<RelayInfo>,
+    channel: Channel,
+}
+
+impl GuardEntry {
+    /// Open a channel from the remembered address alone.
+    fn reconnect(&self) -> Option<OpenGuard> {
+        let contact = self.contact?;
+        match Channel::connect(contact.addr, Some(&contact.ed_identity)) {
+            Ok(channel) => Some(OpenGuard {
+                identity: self.identity,
+                relay: None,
+                channel,
+            }),
+            Err(e) => {
+                crate::debug!("saved guard {} did not answer: {e}", contact.addr);
+                None
+            }
+        }
+    }
+}
+
+impl Guards {
+    /// The first entry worth trying: unfailed ones in order, then any whose
+    /// cool-off has elapsed.
+    fn next_candidate(&self) -> Option<[u8; 20]> {
+        if let Some(entry) = self.entries.iter().find(|e| e.failed_at.is_none()) {
+            return Some(entry.identity);
+        }
+        self.entries
+            .iter()
+            .find(|e| {
+                e.failed_at
+                    .is_some_and(|at| at.elapsed() >= GUARD_RETRY_INTERVAL)
+            })
+            .map(|e| e.identity)
+    }
+
+    fn mark_failed(&mut self, identity: &[u8; 20]) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| &e.identity == identity) {
+            entry.failed_at = Some(Instant::now());
+        }
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| &open.identity == identity)
+        {
+            if let Some(open) = self.open.take() {
+                open.channel.close();
+            }
+        }
+    }
+
+    fn mark_working(&mut self, identity: &[u8; 20]) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| &e.identity == identity) {
+            entry.failed_at = None;
+        }
+    }
+
+    /// Copy the open channel's address and identity onto its list entry, so a
+    /// restart can go straight back to it.
+    fn record_contact(&mut self, identity: &[u8; 20]) {
+        let Some(open) = self.open.as_ref().filter(|o| &o.identity == identity) else {
+            return;
+        };
+        let contact = GuardContact {
+            addr: open.channel.peer(),
+            ed_identity: *open.channel.ed_identity(),
+        };
+        if let Some(entry) = self.entries.iter_mut().find(|e| &e.identity == identity) {
+            entry.contact = Some(contact);
+        }
+    }
 }
 
 struct PooledCircuit {
@@ -116,21 +237,36 @@ struct PooledCircuit {
 
 impl TorClient {
     /// Bootstrap: get a verified consensus, then pick and pin a guard.
-    pub fn bootstrap(state_dir: PathBuf) -> io::Result<Self> {
+    ///
+    /// When guards are already on disk the consensus is fetched through one of
+    /// them rather than through a fallback mirror, which saves a whole TLS
+    /// connection on every start after the first.
+    pub fn bootstrap(state_dir: PathBuf) -> io::Result<Arc<Self>> {
         fs::create_dir_all(&state_dir)?;
-        let directory = Directory::bootstrap(Cache::new(&state_dir))?;
-        let client = Self {
-            directory,
+        let entries = load_guards(&state_dir);
+
+        // Reconnect to a saved guard before anything else. Its address and
+        // Ed25519 identity were saved with it, which is all a channel needs --
+        // the consensus is only needed later, for the onion key that CREATE2
+        // wants -- so the consensus itself can come through the guard.
+        let open = entries.iter().find_map(GuardEntry::reconnect);
+        if let Some(open) = &open {
+            crate::debug!("reconnected to the saved guard at {}", open.channel.peer());
+        }
+
+        let directory = Self::bootstrap_directory(&state_dir, open.as_ref())?;
+        let client = Arc::new(Self {
+            directory: RwLock::new(Arc::new(directory)),
             state_dir,
-            guard: Mutex::new(None),
-            failed_guards: Mutex::new(Vec::new()),
+            guards: Mutex::new(Guards { entries, open }),
             circuits: Mutex::new(Vec::new()),
             microdescs: Mutex::new(HashMap::new()),
             hsdir_ring: Mutex::new(None),
             hsdir_build: Mutex::new(()),
+            hsdir_wanted: AtomicBool::new(false),
             descriptors: Mutex::new(HashMap::new()),
             onion_circuits: Mutex::new(HashMap::new()),
-        };
+        });
         // Open the guard channel now: an unreachable guard should be replaced
         // during startup, not on the first request.
         let (channel, _) = client.guard_channel()?;
@@ -139,7 +275,70 @@ impl TorClient {
             channel.peer(),
             channel.link_version()
         );
+        super::maintain::spawn(&client);
         Ok(client)
+    }
+
+    /// Get a verified consensus, preferring the already-open guard channel and
+    /// falling back to a directory mirror if that does not work out.
+    fn bootstrap_directory(state_dir: &Path, open: Option<&OpenGuard>) -> io::Result<Directory> {
+        if let Some(open) = open {
+            let channel = open.channel.clone();
+            let attempt =
+                Directory::bootstrap(Cache::new(state_dir), || DirCircuit::on(channel.clone()));
+            match attempt {
+                Ok(directory) => return Ok(directory),
+                Err(e) => crate::warn!(
+                    "could not get a consensus through the guard at {} ({e}); \
+                     falling back to a directory mirror",
+                    open.channel.peer()
+                ),
+            }
+        }
+        Directory::bootstrap(Cache::new(state_dir), DirCircuit::to_random_fallback)
+    }
+
+    /// The current view of the network. Take a clone and use it; holding the
+    /// lock across a circuit build would block every refresh behind it.
+    pub fn directory(&self) -> Arc<Directory> {
+        Arc::clone(&self.directory.read().unwrap())
+    }
+
+    /// Adopt a newly verified consensus.
+    ///
+    /// The HSDir ring is derived from the consensus and from its `valid-after`
+    /// in particular, so it is always thrown away here. Descriptors survive
+    /// only while the time period is unchanged, which their stored period
+    /// number already decides. Circuits and cached microdescriptors are keyed
+    /// by things that do not move, so they stay.
+    pub fn install_directory(&self, next: Directory) {
+        let summary = next.summary();
+        *self.directory.write().unwrap() = Arc::new(next);
+        *self.hsdir_ring.lock().unwrap() = None;
+        crate::info!("consensus updated: {summary}");
+    }
+
+    /// Fetch and adopt a newer consensus. Called only by the maintenance
+    /// thread; a failure leaves the client on the consensus it already has.
+    pub fn refresh_consensus(&self) -> io::Result<()> {
+        let directory = self.directory();
+        let dir_circuit = self.dir_circuit()?;
+        let fetched = directory.refresh(&dir_circuit, now_unix());
+        dir_circuit.close();
+        self.install_directory(fetched?);
+        self.reconcile_guards();
+        Ok(())
+    }
+
+    /// Rebuild the HSDir ring in the background, but only for a client that
+    /// has actually used one.
+    pub fn prefetch_hsdir_ring(&self) {
+        if !self.hsdir_wanted.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = self.hsdir_ring() {
+            crate::warn!("could not rebuild the HSDir ring: {e}");
+        }
     }
 
     /// Open a stream to `host:port` through a three-hop circuit.
@@ -212,7 +411,8 @@ impl TorClient {
 
         // Sample exit and middle candidates together so their microdescriptors
         // come back in one directory request.
-        let consensus = &self.directory.consensus;
+        let directory = self.directory();
+        let consensus = &directory.consensus;
         let exit_pool = path::exit_candidates(consensus, &constraints);
         let exits = path::sample(&exit_pool, EXIT_SAMPLE)?;
         let middle_pool = path::middle_candidates(consensus, &constraints);
@@ -302,7 +502,8 @@ impl TorClient {
 
     /// Draw a middle relay that fits the constraints, with its onion key.
     fn choose_middle(&self, constraints: &PathConstraints) -> io::Result<RelayInfo> {
-        let pool = path::middle_candidates(&self.directory.consensus, constraints);
+        let directory = self.directory();
+        let pool = path::middle_candidates(&directory.consensus, constraints);
         let sampled = path::sample(&pool, MIDDLE_SAMPLE)?;
         let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
@@ -327,10 +528,11 @@ impl TorClient {
     /// not somewhere the rest of the path already goes.
     pub fn choose_rendezvous_point(&self) -> io::Result<RelayInfo> {
         let mut constraints = PathConstraints::default();
-        if let Ok(guard) = self.ensure_guard() {
+        if let Ok(guard) = self.ensure_guard().and_then(|id| self.guard_relay(&id)) {
             self.constrain(&mut constraints, &guard);
         }
-        let pool = path::rendezvous_candidates(&self.directory.consensus, &constraints);
+        let directory = self.directory();
+        let pool = path::rendezvous_candidates(&directory.consensus, &constraints);
         let sampled = path::sample(&pool, RENDEZVOUS_SAMPLE)?;
         let wanted: Vec<[u8; 32]> = sampled.iter().map(|r| r.microdesc_digest).collect();
         let fetched = self.load_microdescs(&wanted)?;
@@ -365,7 +567,7 @@ impl TorClient {
     }
 
     fn router(&self, identity: &[u8; 20]) -> Option<RouterStatus> {
-        self.directory
+        self.directory()
             .consensus
             .routers
             .iter()
@@ -373,69 +575,58 @@ impl TorClient {
             .cloned()
     }
 
-    /// The pinned guard, loading it from disk or choosing a new one.
-    fn ensure_guard(&self) -> io::Result<RelayInfo> {
-        {
-            let guard = self.guard.lock().unwrap();
-            if let Some(state) = guard.as_ref() {
-                return Ok(state.relay.clone());
+    /// The pinned guard, choosing and recording a new one if the list is
+    /// empty or every entry on it is in its cool-off period.
+    fn ensure_guard(&self) -> io::Result<[u8; 20]> {
+        if let Some(identity) = self.guards.lock().unwrap().next_candidate() {
+            return Ok(identity);
+        }
+        let directory = self.directory();
+        let chosen = {
+            let guards = self.guards.lock().unwrap();
+            // Racing threads must not each add a guard, so re-check under the
+            // lock we are about to extend the list with.
+            if let Some(identity) = guards.next_candidate() {
+                return Ok(identity);
             }
+            if guards.entries.len() >= MAX_GUARDS {
+                // Every guard we have is cooling off, and adding a fourth
+                // would defeat the point of pinning. Retry the least recently
+                // failed one instead.
+                let soonest = guards
+                    .entries
+                    .iter()
+                    .min_by_key(|e| e.failed_at)
+                    .map(|e| e.identity);
+                return soonest.ok_or_else(|| io::Error::other("no guard to try"));
+            }
+            let taken: Vec<[u8; 20]> = guards.entries.iter().map(|e| e.identity).collect();
+            let candidates: Vec<&RouterStatus> = path::guard_candidates(&directory.consensus)
+                .into_iter()
+                .filter(|r| !taken.contains(&r.identity))
+                .collect();
+            path::weighted_choice(&candidates)?.identity
+        };
+        let mut guards = self.guards.lock().unwrap();
+        if !guards.entries.iter().any(|e| e.identity == chosen) {
+            crate::info!("adding guard {}", hex_encode(&chosen[..8]));
+            guards.entries.push(GuardEntry {
+                identity: chosen,
+                contact: None,
+                failed_at: None,
+            });
         }
-
-        let status = self.choose_guard()?;
-        // The guard's microdescriptor is fetched over a fallback directory
-        // circuit: we have no guard channel to fetch it through yet.
-        let relay = self.resolve_relay(&status)?;
-        self.save_guard(&status.identity);
-        let mut guard = self.guard.lock().unwrap();
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.relay.clone());
-        }
-        *guard = Some(GuardState {
-            relay: relay.clone(),
-            identity: status.identity,
-            channel: None,
-        });
-        Ok(relay)
+        self.save_guards(&guards);
+        Ok(chosen)
     }
 
-    /// Prefer the guard saved on disk; otherwise draw a new one. Guards that
-    /// have already failed this run are never chosen.
-    fn choose_guard(&self) -> io::Result<RouterStatus> {
-        let failed = self.failed_guards.lock().unwrap().clone();
-        let saved = self
-            .load_saved_guard()
-            .filter(|id| !failed.contains(id))
-            .and_then(|id| self.router(&id))
-            .filter(|r| r.has(path::GUARD_FLAGS));
-        if let Some(status) = saved {
-            return Ok(status);
-        }
-        let candidates: Vec<&RouterStatus> = path::guard_candidates(&self.directory.consensus)
-            .into_iter()
-            .filter(|r| !failed.contains(&r.identity))
-            .collect();
-        path::weighted_choice(&candidates).cloned()
-    }
-
-    /// Give up on the current guard and forget the saved choice.
-    fn forget_guard(&self, identity: &[u8; 20]) {
-        let mut guard = self.guard.lock().unwrap();
-        if guard
-            .as_ref()
-            .is_some_and(|state| &state.identity == identity)
-        {
-            if let Some(channel) = guard.as_ref().and_then(|s| s.channel.as_ref()) {
-                channel.close();
-            }
-            *guard = None;
-        }
-        drop(guard);
-        let mut failed = self.failed_guards.lock().unwrap();
-        if !failed.contains(identity) {
-            failed.push(*identity);
-        }
-        let _ = fs::remove_file(self.state_dir.join(GUARD_FILE));
+    /// Everything needed to run ntor with a guard: its address, onion key and
+    /// identities, from the consensus and its microdescriptor.
+    fn guard_relay(&self, identity: &[u8; 20]) -> io::Result<RelayInfo> {
+        let status = self
+            .router(identity)
+            .ok_or_else(|| invalid_data("the guard is no longer in the consensus"))?;
+        self.resolve_relay(&status)
     }
 
     /// Turn a consensus entry into everything needed for a handshake.
@@ -447,20 +638,94 @@ impl TorClient {
         Ok(relay_info(status, md))
     }
 
-    fn load_saved_guard(&self) -> Option<[u8; 20]> {
-        let text = fs::read_to_string(self.state_dir.join(GUARD_FILE)).ok()?;
-        hex_decode(text.trim()).ok()?.try_into().ok()
-    }
-
-    fn save_guard(&self, identity: &[u8; 20]) {
-        let path = self.state_dir.join(GUARD_FILE);
-        if let Err(e) = fs::write(&path, hex_encode(identity)) {
-            crate::warn!("could not persist the guard choice: {e}");
+    /// Drop guards this consensus no longer lists at all, and write the list
+    /// back out. A guard that is merely not Running stays: that judgement is
+    /// the network's, and it may not be true from here.
+    pub fn reconcile_guards(&self) {
+        let directory = self.directory();
+        let mut guards = self.guards.lock().unwrap();
+        let before = guards.entries.len();
+        guards.entries.retain(|entry| {
+            let known = directory
+                .consensus
+                .routers
+                .iter()
+                .any(|r| r.identity == entry.identity);
+            if !known {
+                crate::info!(
+                    "guard {} has left the consensus; dropping it",
+                    hex_encode(&entry.identity[..8])
+                );
+            }
+            known
+        });
+        if guards.entries.len() != before {
+            self.save_guards(&guards);
         }
     }
 
-    /// An open channel to the guard together with the guard it belongs to,
-    /// reconnecting or re-choosing as needed.
+    /// Try the primary guard again after it failed. Called by the maintenance
+    /// thread, so that a moment's network trouble does not move us off it for
+    /// good.
+    pub fn retry_primary_guard(&self) {
+        let primary = {
+            let guards = self.guards.lock().unwrap();
+            let Some(entry) = guards.entries.first() else {
+                return;
+            };
+            // Nothing to do when the primary is the one already in use.
+            if entry.failed_at.is_none()
+                && guards
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.identity == entry.identity)
+            {
+                return;
+            }
+            if entry
+                .failed_at
+                .is_some_and(|at| at.elapsed() < GUARD_RETRY_INTERVAL)
+            {
+                return;
+            }
+            entry.identity
+        };
+        let Ok(relay) = self.guard_relay(&primary) else {
+            return;
+        };
+        match Channel::connect(relay.addr, relay.ed_identity.as_ref()) {
+            Ok(channel) => {
+                crate::info!("primary guard {} is reachable again", relay.addr);
+                let mut guards = self.guards.lock().unwrap();
+                guards.mark_working(&primary);
+                // Existing circuits keep the channel they were built on; only
+                // new ones follow the primary back.
+                let displaced = guards.open.replace(OpenGuard {
+                    identity: primary,
+                    relay: Some(relay),
+                    channel,
+                });
+                guards.record_contact(&primary);
+                self.save_guards(&guards);
+                drop(guards);
+                if let Some(old) = displaced {
+                    // Do not close it: circuits built on it are still running.
+                    crate::debug!("guard {} is no longer the default", old.channel.peer());
+                }
+            }
+            Err(e) => crate::debug!("primary guard still unreachable: {e}"),
+        }
+    }
+
+    fn save_guards(&self, guards: &Guards) {
+        let text = serialize_guards(&guards.entries);
+        if let Err(e) = fs::write(self.state_dir.join(GUARDS_FILE), text) {
+            crate::warn!("could not persist the guard list: {e}");
+        }
+    }
+
+    /// An open channel to a guard together with the guard it belongs to,
+    /// reconnecting or falling back to the next guard as needed.
     ///
     /// The two are returned together on purpose: a circuit built on this
     /// channel must run ntor against *this* guard's keys, and failover can
@@ -468,11 +733,26 @@ impl TorClient {
     fn guard_channel(&self) -> io::Result<(Channel, RelayInfo)> {
         let mut last: Option<io::Error> = None;
         for _ in 0..GUARD_ATTEMPTS {
-            if let Some(open) = self.open_guard_channel() {
-                return Ok(open);
+            match self.open_guard_channel() {
+                Ok(Some(open)) => return Ok(open),
+                Ok(None) => {}
+                // Whatever stopped us using the open channel will be
+                // rediscovered below, with the guard named in the message.
+                Err(e) => crate::debug!("the open guard channel is unusable: {e}"),
             }
-            let relay = self.ensure_guard()?;
-            let identity = relay.rsa_identity;
+            let identity = self.ensure_guard()?;
+            let relay = match self.guard_relay(&identity) {
+                Ok(relay) => relay,
+                Err(e) => {
+                    crate::warn!(
+                        "guard {} cannot be resolved ({e})",
+                        hex_encode(&identity[..8])
+                    );
+                    self.guards.lock().unwrap().mark_failed(&identity);
+                    last = Some(e);
+                    continue;
+                }
+            };
             match Channel::connect(relay.addr, relay.ed_identity.as_ref()) {
                 Ok(channel) => {
                     crate::debug!(
@@ -481,12 +761,27 @@ impl TorClient {
                         channel.link_version(),
                         hex_encode(&channel.ed_identity()[..8])
                     );
-                    return Ok(self.store_guard_channel(channel, relay));
+                    return Ok(self.store_guard_channel(identity, channel, relay));
                 }
                 Err(e) => {
-                    // The consensus called it Running, but we cannot reach it.
-                    crate::warn!("guard {} unusable ({e}); choosing another", relay.addr);
-                    self.forget_guard(&identity);
+                    // Before blaming the guard, check that anything at all is
+                    // reachable. Losing the network for a moment must not cost
+                    // us the guard we have been pinned to.
+                    if !network_reachable() {
+                        crate::warn!(
+                            "guard {} unreachable and so is everything else; \
+                                      keeping the guard",
+                            relay.addr
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            format!("the network is unreachable ({e})"),
+                        ));
+                    }
+                    crate::warn!("guard {} unusable ({e}); trying the next one", relay.addr);
+                    let mut guards = self.guards.lock().unwrap();
+                    guards.mark_failed(&identity);
+                    self.save_guards(&guards);
                     last = Some(e);
                 }
             }
@@ -494,31 +789,72 @@ impl TorClient {
         Err(last.unwrap_or_else(|| io::Error::other("no guard would accept a connection")))
     }
 
-    fn open_guard_channel(&self) -> Option<(Channel, RelayInfo)> {
-        let guard = self.guard.lock().unwrap();
-        let state = guard.as_ref()?;
-        let channel = state.channel.clone()?;
-        if channel.is_closed() {
-            return None;
+    /// The channel currently in use, if it is still up and we know enough
+    /// about its guard to build circuits on it.
+    fn open_guard_channel(&self) -> io::Result<Option<(Channel, RelayInfo)>> {
+        let (identity, channel, relay) = {
+            let guards = self.guards.lock().unwrap();
+            let Some(open) = guards.open.as_ref() else {
+                return Ok(None);
+            };
+            if open.channel.is_closed() {
+                return Ok(None);
+            }
+            (open.identity, open.channel.clone(), open.relay.clone())
+        };
+        match relay {
+            Some(relay) => Ok(Some((channel, relay))),
+            // The channel was opened from the saved address alone, before
+            // there was a consensus to look the onion key up in.
+            None => {
+                let relay = self.guard_relay(&identity)?;
+                let mut guards = self.guards.lock().unwrap();
+                if let Some(open) = guards.open.as_mut() {
+                    if open.identity == identity {
+                        open.relay = Some(relay.clone());
+                    }
+                }
+                guards.record_contact(&identity);
+                self.save_guards(&guards);
+                Ok(Some((channel, relay)))
+            }
         }
-        Some((channel, state.relay.clone()))
+    }
+
+    /// The open guard channel alone, without resolving the guard's keys.
+    fn open_guard_channel_only(&self) -> Option<Channel> {
+        let guards = self.guards.lock().unwrap();
+        let channel = guards.open.as_ref()?.channel.clone();
+        (!channel.is_closed()).then_some(channel)
     }
 
     /// Publish a freshly opened channel, deferring to one another thread may
     /// have stored first.
-    fn store_guard_channel(&self, channel: Channel, relay: RelayInfo) -> (Channel, RelayInfo) {
-        let mut guard = self.guard.lock().unwrap();
-        if let Some(state) = guard.as_mut() {
-            match state.channel.as_ref() {
-                Some(existing) if !existing.is_closed() => {
-                    let open = (existing.clone(), state.relay.clone());
-                    drop(guard);
+    fn store_guard_channel(
+        &self,
+        identity: [u8; 20],
+        channel: Channel,
+        relay: RelayInfo,
+    ) -> (Channel, RelayInfo) {
+        let mut guards = self.guards.lock().unwrap();
+        guards.mark_working(&identity);
+        if let Some(open) = guards.open.as_ref() {
+            if !open.channel.is_closed() {
+                if let Some(relay) = open.relay.clone() {
+                    let existing = (open.channel.clone(), relay);
+                    drop(guards);
                     channel.close();
-                    return open;
+                    return existing;
                 }
-                _ => state.channel = Some(channel.clone()),
             }
         }
+        guards.open = Some(OpenGuard {
+            identity,
+            relay: Some(relay.clone()),
+            channel: channel.clone(),
+        });
+        guards.record_contact(&identity);
+        self.save_guards(&guards);
         (channel, relay)
     }
 
@@ -545,7 +881,7 @@ impl TorClient {
         }
 
         let dir_circuit = self.dir_circuit()?;
-        let fetched = self.directory.microdescs(&missing, &dir_circuit);
+        let fetched = self.directory().microdescs(&missing, &dir_circuit);
         dir_circuit.close();
         let fetched = fetched?;
 
@@ -565,7 +901,10 @@ impl TorClient {
     /// A one-hop directory circuit, on the guard channel when one is already
     /// open, so a directory fetch costs no extra connection.
     fn dir_circuit(&self) -> io::Result<DirCircuit> {
-        if let Some((channel, _)) = self.open_guard_channel() {
+        // The relay details are not needed for a one-hop CREATE_FAST circuit,
+        // so take the channel directly rather than through the accessor that
+        // would go and fetch a microdescriptor first.
+        if let Some(channel) = self.open_guard_channel_only() {
             let peer = channel.peer();
             match DirCircuit::on(channel) {
                 Ok(dir_circuit) => return Ok(dir_circuit),
@@ -583,7 +922,9 @@ impl TorClient {
     /// takes the better part of a minute. Afterwards the disk cache makes it
     /// quick, and the ring itself is kept until the consensus changes.
     pub fn hsdir_ring(&self) -> io::Result<Arc<HsdirRing>> {
-        let valid_after = self.directory.consensus.valid_after;
+        self.hsdir_wanted.store(true, Ordering::Relaxed);
+        let directory = self.directory();
+        let valid_after = directory.consensus.valid_after;
         if let Some(ring) = self.cached_hsdir_ring(valid_after) {
             return Ok(ring);
         }
@@ -595,7 +936,7 @@ impl TorClient {
         }
 
         let started = Instant::now();
-        let consensus = &self.directory.consensus;
+        let consensus = &directory.consensus;
         let period = TimePeriod::containing(valid_after, consensus.params.hsdir_interval);
         let srv = hsdir::shared_random_value(consensus, &period);
 
@@ -612,7 +953,7 @@ impl TorClient {
         let digests: Vec<[u8; 32]> = hsdirs.iter().map(|r| r.microdesc_digest).collect();
 
         let dir_circuit = self.dir_circuit()?;
-        let ed_ids = self.directory.microdesc_ed_ids(&digests, &dir_circuit);
+        let ed_ids = directory.microdesc_ed_ids(&digests, &dir_circuit);
         dir_circuit.close();
 
         let nodes = hsdir::build_ring(
@@ -655,15 +996,15 @@ impl TorClient {
     }
 
     pub fn consensus_summary(&self) -> String {
-        self.directory.summary()
+        self.directory().summary()
     }
 
     /// The verified consensus. Only the live tests reach for this; everything
     /// the client itself needs is already folded into the ring and the path
     /// selection above.
     #[cfg(test)]
-    pub fn consensus(&self) -> &super::dir::consensus::Consensus {
-        &self.directory.consensus
+    pub fn consensus(&self) -> Arc<Directory> {
+        self.directory()
     }
 }
 
@@ -932,6 +1273,86 @@ fn extend_path(
     Ok(circuit)
 }
 
+/// Read `state/guards`: one guard per line, in priority order, as
+/// `<RSA identity hex> [<ip:port> <Ed25519 identity hex>]`.
+///
+/// The contact fields are optional so that a hand-written file naming only a
+/// fingerprint still works; they are filled in the first time the guard is
+/// reached. A line that will not parse is skipped rather than fatal -- a
+/// corrupt state file should cost a guard choice, not a start-up.
+fn load_guards(state_dir: &Path) -> Vec<GuardEntry> {
+    let mut text = fs::read_to_string(state_dir.join(GUARDS_FILE)).unwrap_or_default();
+    if text.trim().is_empty() {
+        // Earlier versions kept a single guard in a file of its own.
+        text = fs::read_to_string(state_dir.join(LEGACY_GUARD_FILE)).unwrap_or_default();
+    }
+
+    let mut entries: Vec<GuardEntry> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(identity) = fields
+            .next()
+            .and_then(|hex| hex_decode(hex).ok())
+            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+        else {
+            continue;
+        };
+        if entries.iter().any(|e| e.identity == identity) {
+            continue;
+        }
+        let contact = (|| {
+            let addr: SocketAddrV4 = fields.next()?.parse().ok()?;
+            let ed_identity = <[u8; 32]>::try_from(hex_decode(fields.next()?).ok()?).ok()?;
+            Some(GuardContact { addr, ed_identity })
+        })();
+        entries.push(GuardEntry {
+            identity,
+            contact,
+            failed_at: None,
+        });
+        if entries.len() == MAX_GUARDS {
+            break;
+        }
+    }
+    entries
+}
+
+fn serialize_guards(entries: &[GuardEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries.iter().take(MAX_GUARDS) {
+        out.push_str(&hex_encode(&entry.identity));
+        if let Some(contact) = entry.contact {
+            out.push(' ');
+            out.push_str(&contact.addr.to_string());
+            out.push(' ');
+            out.push_str(&hex_encode(&contact.ed_identity));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Is anything on the Tor network reachable from here at all?
+///
+/// Asked when a guard refuses a connection, to tell "the guard is down" from
+/// "our network is down". Only the former should cost us the guard, so a
+/// couple of fallback mirrors are probed with a bare TCP connect -- two,
+/// because any one of them may itself be down.
+fn network_reachable() -> bool {
+    let dirs = fallback::FALLBACK_DIRS;
+    for _ in 0..REACHABILITY_PROBES {
+        let Ok(index) = rand::below(dirs.len() as u64) else {
+            return true;
+        };
+        let entry = &dirs[index as usize];
+        let addr = SocketAddrV4::new(Ipv4Addr::from(entry.ipv4), entry.or_port);
+        if TcpStream::connect_timeout(&addr.into(), REACHABILITY_TIMEOUT).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 fn relay_info(status: &RouterStatus, md: &Microdesc) -> RelayInfo {
     RelayInfo {
         addr: SocketAddrV4::new(Ipv4Addr::from(status.ipv4), status.or_port),
@@ -991,9 +1412,16 @@ mod live_tests {
         assert_eq!(client.circuits.lock().unwrap().len(), 1);
         second.close();
 
-        // The guard is pinned on disk, so a restart keeps the same one.
-        let saved = fs::read_to_string(dir.join(GUARD_FILE)).unwrap();
-        assert_eq!(saved.len(), 40, "guard file should hold a hex fingerprint");
+        // The guard is pinned on disk, so a restart keeps the same one, and
+        // its address is saved with it so the restart can reconnect before it
+        // has a consensus.
+        let saved = fs::read_to_string(dir.join(GUARDS_FILE)).unwrap();
+        let fields: Vec<&str> = saved.lines().next().unwrap().split(' ').collect();
+        assert_eq!(fields.len(), 3, "identity, address and Ed25519 identity");
+        assert_eq!(fields[0].len(), 40, "a hex RSA fingerprint");
+        assert!(fields[1].parse::<SocketAddrV4>().is_ok(), "{}", fields[1]);
+        assert_eq!(fields[2].len(), 64, "a hex Ed25519 identity");
+        assert!(saved.lines().count() <= MAX_GUARDS);
 
         let _ = fs::remove_dir_all(&dir);
     }

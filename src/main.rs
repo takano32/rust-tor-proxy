@@ -37,6 +37,12 @@ fn run() -> std::io::Result<()> {
     if let Some((ssl, crypto)) = ffi::library_paths() {
         debug!("OpenSSL loaded from {ssl} and {crypto}");
     }
+    // Compression is optional: without libz the directory is fetched
+    // uncompressed, which works but costs several megabytes at start-up.
+    match ffi::zlib::version() {
+        Some(version) => debug!("zlib {version} loaded; directory documents will be compressed"),
+        None => warn!("no libz found; directory documents will be fetched uncompressed"),
+    }
 
     // Bind before bootstrapping, so a port conflict is reported immediately
     // rather than after a minute of directory work.

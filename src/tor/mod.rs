@@ -5,7 +5,9 @@ pub mod circuit;
 pub mod client;
 pub mod dir;
 pub mod hs;
+pub mod maintain;
 pub mod ntor;
+pub mod ntor_v3;
 pub mod path;
 
 use std::net::SocketAddrV4;

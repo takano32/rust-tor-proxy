@@ -66,10 +66,11 @@ mod live_tests {
             ring.period.number,
             ring.period.length
         );
+        let directory = client.consensus();
         println!(
             "shared random value {}",
             hex_encode(&hsdir::shared_random_value(
-                client.consensus(),
+                &directory.consensus,
                 &ring.period
             ))
         );
@@ -87,8 +88,8 @@ mod live_tests {
         let responsible = ring.responsible_for(&blinded);
         assert_eq!(responsible.len(), 6, "two replicas of three HSDirs");
         for (index, identity) in responsible.iter().enumerate() {
-            let status = client
-                .consensus()
+            let status = directory
+                .consensus
                 .routers
                 .iter()
                 .find(|r| &r.identity == identity)

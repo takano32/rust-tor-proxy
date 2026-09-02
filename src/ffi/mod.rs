@@ -41,6 +41,7 @@ pub mod rand;
 pub mod rsa;
 pub mod tls;
 pub mod x25519;
+pub mod zlib;
 
 pub const SSL_VERIFY_NONE: c_int = 0;
 pub const SSL_ERROR_WANT_READ: c_int = 2;

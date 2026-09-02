@@ -1,17 +1,18 @@
 pub mod authority;
 pub mod cache;
 pub mod consensus;
+pub mod diff;
 pub mod fallback;
 pub mod fetch;
 pub mod microdesc;
 pub mod netdoc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use authority::KeyCertificate;
-use cache::Cache;
+use cache::{Cache, PruneReport};
 use consensus::Consensus;
 use microdesc::Microdesc;
 
@@ -113,6 +114,15 @@ impl DirCircuit {
         fetch::get(&self.circuit, path)
     }
 
+    pub fn get_with(&self, path: &str, headers: &[(&str, String)]) -> io::Result<Vec<u8>> {
+        fetch::get_with(&self.circuit, path, headers)
+    }
+
+    /// Several paths at once, on separate streams over this one circuit.
+    pub fn get_parallel(&self, paths: &[String]) -> Vec<io::Result<Vec<u8>>> {
+        fetch::get_parallel(&self.circuit, paths)
+    }
+
     pub fn peer(&self) -> SocketAddrV4 {
         self.channel.peer()
     }
@@ -134,16 +144,42 @@ pub struct Directory {
 
 impl Directory {
     /// Load a live consensus from the cache, or fetch and verify a new one.
-    pub fn bootstrap(cache: Cache) -> io::Result<Self> {
+    ///
+    /// `open_circuit` supplies the one-hop directory circuit, so that a client
+    /// which already knows a guard can bootstrap through it rather than
+    /// opening a second connection to a fallback mirror.
+    pub fn bootstrap(
+        cache: Cache,
+        open_circuit: impl Fn() -> io::Result<DirCircuit>,
+    ) -> io::Result<Self> {
         let now = now_unix();
         if let Some(directory) = Self::from_cache(&cache, now) {
             crate::info!("using cached consensus: {}", directory.summary());
             return Ok(directory);
         }
 
-        let dir_circuit = DirCircuit::to_random_fallback()?;
+        // Even an expired cached consensus is worth keeping hold of: the
+        // server can send a diff against it instead of three megabytes.
+        let stale = cache
+            .load(CONSENSUS_FILE)
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let certs = cache
+            .load(CERTS_FILE)
+            .map(|raw| authority::parse_key_certificates(&String::from_utf8_lossy(&raw), now))
+            .unwrap_or_default();
+
+        let dir_circuit = open_circuit()?;
         crate::info!("fetching consensus from {}", dir_circuit.peer());
-        let result = Self::fetch(&cache, &dir_circuit, now);
+        let mut result = Self::download(&cache, &dir_circuit, now, stale.as_deref(), &certs);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::AlreadyExists)
+        {
+            // The server says our copy is current, but we got here because it
+            // will not verify or has expired. Ask for it in full.
+            crate::debug!("the cached consensus is unusable despite being current; refetching");
+            result = Self::download(&cache, &dir_circuit, now, None, &certs);
+        }
         dir_circuit.close();
         if let Ok(directory) = &result {
             crate::info!("consensus verified: {}", directory.summary());
@@ -170,44 +206,150 @@ impl Directory {
         })
     }
 
-    fn fetch(cache: &Cache, dir_circuit: &DirCircuit, now: u64) -> io::Result<Self> {
-        let consensus_raw = dir_circuit.get(CONSENSUS_PATH)?;
-        let consensus_text = String::from_utf8(consensus_raw)
-            .map_err(|_| invalid_data("consensus is not valid UTF-8"))?;
-
-        // Ask for exactly the certificates this consensus was signed with.
-        let wanted = consensus::required_certificates(&consensus_text);
-        if wanted.is_empty() {
-            return Err(invalid_data(
-                "consensus carries no signature from a trusted authority",
-            ));
+    /// Fetch a newer consensus, asking for a diff against the one we hold.
+    ///
+    /// Returns a whole new `Directory`; the caller swaps it into place, so a
+    /// failed refresh leaves the running client on the consensus it had.
+    pub fn refresh(&self, dir_circuit: &DirCircuit, now: u64) -> io::Result<Self> {
+        let base = self
+            .cache
+            .load(CONSENSUS_FILE)
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let next = Self::download(&self.cache, dir_circuit, now, base.as_deref(), &self.certs)?;
+        if next.consensus.valid_after <= self.consensus.valid_after {
+            return Err(invalid_data(format!(
+                "directory server offered a consensus from {}, no newer than the one we hold",
+                crate::util::format_datetime(next.consensus.valid_after)
+            )));
         }
-        let path = format!(
-            "/tor/keys/fp-sk/{}",
-            wanted
-                .iter()
-                .map(|(id, key)| format!("{}-{}", hex_encode(id), hex_encode(key)))
-                .collect::<Vec<_>>()
-                .join("+")
-        );
-        let certs_raw = dir_circuit.get(&path)?;
-        let certs_text = String::from_utf8_lossy(&certs_raw).into_owned();
-        let certs = authority::parse_key_certificates(&certs_text, now);
+        Ok(next)
+    }
 
+    /// Download, verify and cache a consensus.
+    ///
+    /// When `base` is present the request carries `X-Or-Diff-From-Consensus`;
+    /// a server that has the matching diff sends a few kilobytes of ed script
+    /// rather than the whole document. Anything that goes wrong with the diff
+    /// -- a hash we do not recognise, a script that will not apply, a result
+    /// that fails verification -- falls back to fetching the document whole,
+    /// because a diff is an optimisation and never a source of truth.
+    fn download(
+        cache: &Cache,
+        dir_circuit: &DirCircuit,
+        now: u64,
+        base: Option<&str>,
+        known_certs: &[KeyCertificate],
+    ) -> io::Result<Self> {
+        let consensus_text = match base {
+            Some(base) => match Self::download_diffed(dir_circuit, base) {
+                Ok(text) => text,
+                // "Not modified": we already hold the current consensus, so
+                // there is nothing to download and nothing has gone wrong.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+                Err(e) => {
+                    crate::warn!("consensus diff unusable ({e}); fetching the whole document");
+                    Self::download_full(dir_circuit)?
+                }
+            },
+            None => Self::download_full(dir_circuit)?,
+        };
+
+        let certs = Self::certificates_for(dir_circuit, &consensus_text, now, known_certs)?;
         let consensus = consensus::parse_and_verify(&consensus_text, &certs, now)?;
 
-        if let Err(e) = cache.store(CERTS_FILE, certs_text.as_bytes()) {
+        // Only cache once the consensus has verified, so neither file can be
+        // left holding a document that would fail on the next start-up.
+        if let Err(e) = cache.store(CERTS_FILE, authority::serialize(&certs).as_bytes()) {
             crate::warn!("could not cache key certificates: {e}");
         }
         if let Err(e) = cache.store(CONSENSUS_FILE, consensus_text.as_bytes()) {
             crate::warn!("could not cache consensus: {e}");
         }
-
         Ok(Self {
             consensus,
             certs,
             cache: Cache::new(cache.dir()),
         })
+    }
+
+    fn download_full(dir_circuit: &DirCircuit) -> io::Result<String> {
+        let raw = dir_circuit.get(CONSENSUS_PATH)?;
+        String::from_utf8(raw).map_err(|_| invalid_data("consensus is not valid UTF-8"))
+    }
+
+    /// Ask for a diff, and accept the answer whichever form it takes: the
+    /// server is free to send the whole document when it has no matching diff.
+    fn download_diffed(dir_circuit: &DirCircuit, base: &str) -> io::Result<String> {
+        // The header names the digest of the *signed part* -- everything up to
+        // and including the first `directory-signature ` -- not of the whole
+        // document. That is what lets one diff serve clients whose copies
+        // carry different sets of authority signatures.
+        let headers = [("X-Or-Diff-From-Consensus", diff::signed_part_digest(base))];
+        let raw = dir_circuit.get_with(CONSENSUS_PATH, &headers)?;
+        let text = String::from_utf8(raw).map_err(|_| invalid_data("consensus is not UTF-8"))?;
+        if !text.starts_with("network-status-diff-version") {
+            return Ok(text);
+        }
+        let patched = diff::apply(base, &text)?;
+        crate::info!(
+            "consensus updated by diff: {} bytes of script for {} bytes of document",
+            text.len(),
+            patched.len()
+        );
+        Ok(patched)
+    }
+
+    /// The key certificates this consensus is signed with, reusing the ones we
+    /// already hold and fetching only what is missing.
+    ///
+    /// Everything is rebuilt from text rather than moved, because a parsed
+    /// certificate owns an OpenSSL key that cannot be cheaply duplicated --
+    /// and re-parsing a dozen certificates once an hour costs nothing.
+    fn certificates_for(
+        dir_circuit: &DirCircuit,
+        consensus_text: &str,
+        now: u64,
+        known: &[KeyCertificate],
+    ) -> io::Result<Vec<KeyCertificate>> {
+        let wanted = consensus::required_certificates(consensus_text);
+        if wanted.is_empty() {
+            return Err(invalid_data(
+                "consensus carries no signature from a trusted authority",
+            ));
+        }
+        let missing: Vec<([u8; 20], [u8; 20])> = wanted
+            .iter()
+            .copied()
+            .filter(|(id, key)| !known.iter().any(|c| c.matches(id, key)))
+            .collect();
+
+        let mut text = authority::serialize(known);
+        if missing.is_empty() {
+            crate::debug!("every signing key this consensus uses is already cached");
+        } else {
+            let path = format!(
+                "/tor/keys/fp-sk/{}",
+                missing
+                    .iter()
+                    .map(|(id, key)| format!("{}-{}", hex_encode(id), hex_encode(key)))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            );
+            let fetched = dir_circuit.get(&path)?;
+            text.push_str(&String::from_utf8_lossy(&fetched));
+        }
+        Ok(authority::parse_key_certificates(&text, now))
+    }
+
+    /// Delete cached microdescriptors this consensus no longer names.
+    pub fn prune_cache(&self) -> io::Result<PruneReport> {
+        let keep: HashSet<[u8; 32]> = self
+            .consensus
+            .routers
+            .iter()
+            .map(|r| r.microdesc_digest)
+            .collect();
+        self.cache.prune_microdescs(&keep)
     }
 
     pub fn certificate_count(&self) -> usize {
@@ -287,25 +429,35 @@ impl Directory {
             }
         }
 
-        let batches = missing.len().div_ceil(MICRODESCS_PER_REQUEST);
-        for (number, batch) in missing.chunks(MICRODESCS_PER_REQUEST).enumerate() {
-            // A handful of relays is routine; thousands means the HSDir table
-            // is being built, which takes long enough to deserve a word.
-            if batches > LOUD_FETCH_BATCHES {
-                crate::info!(
-                    "fetching microdescriptors: batch {} of {batches}",
-                    number + 1
-                );
-            }
-            let path = format!(
-                "/tor/micro/d/{}",
-                batch
-                    .iter()
-                    .map(|d| crate::util::base64_encode_unpadded(d))
-                    .collect::<Vec<_>>()
-                    .join("-")
+        let batches: Vec<&[[u8; 32]]> = missing.chunks(MICRODESCS_PER_REQUEST).collect();
+        let paths: Vec<String> = batches
+            .iter()
+            .map(|batch| {
+                format!(
+                    "/tor/micro/d/{}",
+                    batch
+                        .iter()
+                        .map(|d| crate::util::base64_encode_unpadded(d))
+                        .collect::<Vec<_>>()
+                        .join("-")
+                )
+            })
+            .collect();
+        // A handful of relays is routine; thousands means the HSDir table is
+        // being built, which takes long enough to deserve a word.
+        if batches.len() > LOUD_FETCH_BATCHES {
+            crate::info!(
+                "fetching {} microdescriptors in {} batches, {} at a time",
+                missing.len(),
+                batches.len(),
+                fetch::MAX_PARALLEL_REQUESTS
             );
-            let raw = match dir_circuit.get(&path) {
+        }
+
+        // Several batches share the one circuit, each on its own stream: the
+        // round trips overlap instead of queueing behind one another.
+        for (batch, result) in batches.iter().zip(dir_circuit.get_parallel(&paths)) {
+            let raw = match result {
                 Ok(raw) => raw,
                 Err(e) => {
                     crate::warn!("microdescriptor batch failed: {e}");
@@ -334,6 +486,66 @@ mod live_tests {
     use super::*;
     use crate::tor::dir::consensus::{FLAG_EXIT, FLAG_GUARD, FLAG_RUNNING, FLAG_VALID};
 
+    /// Live check: ask a real directory cache for a diff against the
+    /// consensus we hold.
+    ///
+    /// Which of the two answers comes back depends on the clock: within the
+    /// hour the server has nothing newer to offer, and after it a diff should
+    /// arrive. Both are correct; what this proves is that the request is
+    /// well-formed, that the header digest is the one the server indexes by,
+    /// and that whatever comes back verifies.
+    ///
+    /// Run with `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires network access to the Tor network"]
+    fn asks_for_a_consensus_diff() {
+        crate::log::init();
+        let dir = std::env::temp_dir().join(format!("tor-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let directory = Directory::bootstrap(Cache::new(&dir), DirCircuit::to_random_fallback)
+            .expect("bootstrap");
+        let held = directory.consensus.valid_after;
+        println!(
+            "holding a consensus valid after {}, digest {}",
+            crate::util::format_datetime(held),
+            &diff::signed_part_digest(
+                &String::from_utf8(Cache::new(&dir).load(CONSENSUS_FILE).unwrap()).unwrap()
+            )[..16]
+        );
+
+        let dir_circuit = DirCircuit::to_random_fallback().expect("dir circuit");
+        println!("asking {}", dir_circuit.peer());
+        let result = directory.refresh(&dir_circuit, now_unix());
+        dir_circuit.close();
+
+        match result {
+            Ok(next) => {
+                println!("refreshed: {}", next.summary());
+                assert!(
+                    next.consensus.valid_after > held,
+                    "a refresh must move forwards"
+                );
+                assert!(next.consensus.routers.len() > 1000);
+            }
+            Err(e) => {
+                // The only acceptable failure is "nothing newer exists yet",
+                // which a server states either as HTTP 304 -- proof that it
+                // recognised our digest -- or by sending the same consensus
+                // back.
+                println!("no newer consensus: {e}");
+                assert!(
+                    e.kind() == io::ErrorKind::AlreadyExists
+                        || e.to_string().contains("no newer than"),
+                    "{e}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live check: bootstrap a signature-verified consensus and fetch a few
     /// microdescriptors from it.
     ///
@@ -346,7 +558,8 @@ mod live_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let directory = Directory::bootstrap(Cache::new(&dir)).expect("bootstrap");
+        let directory = Directory::bootstrap(Cache::new(&dir), DirCircuit::to_random_fallback)
+            .expect("bootstrap");
         let consensus = &directory.consensus;
         println!(
             "consensus: {} routers, {} guards, {} exits, {} authority certificates",

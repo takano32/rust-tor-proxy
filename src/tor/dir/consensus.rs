@@ -243,7 +243,7 @@ fn shared_random(text: &str, keyword: &str) -> Option<[u8; 32]> {
 
 /// How much of the document the signatures cover: everything up to and
 /// including the space after the first `directory-signature` keyword.
-fn signed_length(text: &str) -> io::Result<usize> {
+pub(super) fn signed_length(text: &str) -> io::Result<usize> {
     let start = netdoc::line_start_of(text, "directory-signature ")
         .ok_or_else(|| invalid_data("consensus has no directory-signature"))?;
     Ok(start + "directory-signature ".len())

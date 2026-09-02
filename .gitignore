@@ -1,2 +1,3 @@
-/target/
-/state/
+/target
+/state
+/.claude/worktrees/
