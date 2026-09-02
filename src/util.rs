@@ -120,6 +120,65 @@ pub fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(msg: E) -
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// Days from 1970-01-01 to the given proleptic Gregorian date.
+///
+/// Howard Hinnant's `days_from_civil`; the calendar shifts to start in March
+/// so that the leap day lands at the end of the year and the month-length
+/// pattern becomes a simple linear formula.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Parse a directory document timestamp: `YYYY-MM-DD HH:MM:SS`, always UTC.
+pub fn parse_datetime(date: &str, time: &str) -> io::Result<u64> {
+    let bad = || invalid_data(format!("bad timestamp {date:?} {time:?}"));
+    let mut d = date.split('-');
+    let year: i64 = d.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let month: i64 = d.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let day: i64 = d.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    if d.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(bad());
+    }
+    let mut t = time.split(':');
+    let hour: i64 = t.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let minute: i64 = t.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let second: i64 = t.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    if t.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return Err(bad());
+    }
+    let seconds =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(seconds).map_err(|_| bad())
+}
+
+/// Format a unix timestamp the way directory documents do, for log messages.
+pub fn format_datetime(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+    // Invert days_from_civil.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +199,28 @@ mod tests {
         assert_eq!(base64_decode("").unwrap(), b"");
         assert!(base64_decode("a").is_err());
         assert!(base64_decode("****").is_err());
+    }
+
+    #[test]
+    fn datetime_round_trip() {
+        assert_eq!(parse_datetime("1970-01-01", "00:00:00").unwrap(), 0);
+        assert_eq!(parse_datetime("2000-03-01", "00:00:00").unwrap(), 951_868_800);
+        assert_eq!(parse_datetime("2026-09-02", "12:34:56").unwrap(), 1_788_352_496);
+        // A leap day must land where the Gregorian calendar puts it.
+        assert_eq!(
+            parse_datetime("2024-02-29", "00:00:00").unwrap() + 86_400,
+            parse_datetime("2024-03-01", "00:00:00").unwrap()
+        );
+        for stamp in [
+            (0, "1970-01-01 00:00:00"),
+            (1_788_352_496, "2026-09-02 12:34:56"),
+            (951_868_800, "2000-03-01 00:00:00"),
+        ] {
+            assert_eq!(format_datetime(stamp.0), stamp.1);
+        }
+        assert!(parse_datetime("2026-13-01", "00:00:00").is_err());
+        assert!(parse_datetime("2026-09-02", "24:00:00").is_err());
+        assert!(parse_datetime("nope", "00:00:00").is_err());
     }
 
     #[test]

@@ -100,3 +100,125 @@ pub fn required_signatures() -> usize {
     AUTHORITIES.len() / 2 + 1
 }
 
+
+// ---------------------------------------------------------------------------
+// Authority key certificates (dir-spec/creating-key-certificates.md)
+// ---------------------------------------------------------------------------
+
+use std::io;
+
+use super::netdoc;
+use crate::ffi::hash::sha1;
+use crate::ffi::rsa::RsaPublicKey;
+use crate::util::{hex_decode, invalid_data, parse_datetime};
+
+/// One authority's medium-term signing key, certified by its long-term
+/// identity key. Consensus signatures are made with the signing key, so this
+/// is the bridge from the identities embedded above to a usable verifier.
+pub struct KeyCertificate {
+    /// SHA-1 of the DER identity key: matches an `Authority::v3ident`.
+    pub v3ident: [u8; 20],
+    /// SHA-1 of the DER signing key: matches a `directory-signature` line.
+    pub signing_key_digest: [u8; 20],
+    pub signing_key: RsaPublicKey,
+    pub expires: u64,
+}
+
+impl KeyCertificate {
+    /// Parse and fully verify one certificate.
+    fn parse(text: &str, now: u64) -> io::Result<Self> {
+        let version = netdoc::item(text, "dir-key-certificate-version")
+            .ok_or_else(|| invalid_data("key certificate has no version"))?;
+        if version != "3" {
+            return Err(invalid_data(format!(
+                "unsupported key certificate version {version}"
+            )));
+        }
+
+        let fingerprint = netdoc::item(text, "fingerprint")
+            .ok_or_else(|| invalid_data("key certificate has no fingerprint"))?;
+        let v3ident: [u8; 20] = hex_decode(fingerprint)?
+            .try_into()
+            .map_err(|_| invalid_data("key certificate fingerprint is not 20 bytes"))?;
+
+        let expires_args = netdoc::item(text, "dir-key-expires")
+            .ok_or_else(|| invalid_data("key certificate has no dir-key-expires"))?;
+        let (date, time) = expires_args
+            .split_once(' ')
+            .ok_or_else(|| invalid_data("bad dir-key-expires"))?;
+        let expires = parse_datetime(date, time.split(' ').next().unwrap_or(time))?;
+        if now >= expires {
+            return Err(invalid_data(format!(
+                "key certificate expired at {} (local clock says {})",
+                crate::util::format_datetime(expires),
+                crate::util::format_datetime(now)
+            )));
+        }
+
+        // Both keys appear as RSA PUBLIC KEY objects, identity first.
+        let identity_start = netdoc::line_start_of(text, "dir-identity-key")
+            .ok_or_else(|| invalid_data("key certificate has no dir-identity-key"))?;
+        let identity_key = RsaPublicKey::from_pkcs1_der(&netdoc::object(
+            &text[identity_start..],
+            "RSA PUBLIC KEY",
+        )?)?;
+        if identity_key.fingerprint() != v3ident {
+            return Err(invalid_data(
+                "key certificate fingerprint does not match its identity key",
+            ));
+        }
+
+        let signing_start = netdoc::line_start_of(text, "dir-signing-key")
+            .ok_or_else(|| invalid_data("key certificate has no dir-signing-key"))?;
+        let signing_key = RsaPublicKey::from_pkcs1_der(&netdoc::object(
+            &text[signing_start..],
+            "RSA PUBLIC KEY",
+        )?)?;
+        let signing_key_digest = signing_key.fingerprint();
+
+        // The signature covers everything through the newline that ends the
+        // "dir-key-certification" keyword line (it takes no arguments).
+        let signed_end = netdoc::line_end_after(text, "dir-key-certification")
+            .ok_or_else(|| invalid_data("key certificate has no dir-key-certification"))?;
+        let signature = netdoc::object(&text[signed_end..], "SIGNATURE")?;
+        if !identity_key.verify_digest(&sha1(text[..signed_end].as_bytes()), &signature) {
+            return Err(invalid_data(
+                "key certificate is not signed by its own identity key",
+            ));
+        }
+
+        Ok(Self {
+            v3ident,
+            signing_key_digest,
+            signing_key,
+            expires,
+        })
+    }
+}
+
+/// Parse every certificate in a `/tor/keys/...` response, keeping the ones
+/// that verify and that belong to an authority we trust.
+pub fn parse_key_certificates(text: &str, now: u64) -> Vec<KeyCertificate> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = netdoc::line_start_of(rest, "dir-key-certificate-version") {
+        let body = &rest[start..];
+        // A certificate ends after its signature object.
+        let end = match body.find("-----END SIGNATURE-----") {
+            Some(i) => i + "-----END SIGNATURE-----".len(),
+            None => break,
+        };
+        match KeyCertificate::parse(&body[..end], now) {
+            Ok(cert) => {
+                if AUTHORITIES.iter().any(|a| a.v3ident == cert.v3ident) {
+                    out.push(cert);
+                } else {
+                    crate::debug!("ignoring key certificate from an unknown authority");
+                }
+            }
+            Err(e) => crate::warn!("skipping key certificate: {e}"),
+        }
+        rest = &body[end..];
+    }
+    out
+}
