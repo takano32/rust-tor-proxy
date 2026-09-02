@@ -25,6 +25,7 @@ use super::cell::{self, Cell, CELL_BODY_LEN};
 use super::channel::Channel;
 use super::hs::ntor::HsCircuitKeys;
 use super::ntor::{self, CreateFastClient, NtorClient};
+use super::ntor_v3::{Extension, NtorV3Client};
 use super::RelayInfo;
 use crate::ffi::aes::{Aes128Ctr, Aes256Ctr};
 use crate::ffi::hash::Digest;
@@ -96,6 +97,50 @@ pub fn end_reason_name(reason: u8) -> &'static str {
         13 => "TORPROTOCOL",
         14 => "NOTDIRECTORY",
         _ => "UNKNOWN",
+    }
+}
+
+/// The client half of whichever circuit handshake a hop is using.
+///
+/// ntor-v3 is preferred wherever the directory gave us the relay's Ed25519
+/// identity, which it does for every relay with a microdescriptor: it is what
+/// carries the extension lists that negotiate congestion control, and every
+/// relay on the network is required to speak it (`required-relay-protocols`
+/// has `Relay=2-4`). The older ntor stays for the rare relay whose
+/// microdescriptor has no `id ed25519` line, since that handshake names the
+/// relay by the SHA-1 of its RSA key instead.
+enum Handshake {
+    Ntor(NtorClient),
+    NtorV3(NtorV3Client),
+}
+
+impl Handshake {
+    /// Begin a handshake with `relay`, returning the HTYPE and HDATA that
+    /// CREATE2 or EXTEND2 should carry.
+    fn start(relay: &RelayInfo, extensions: &[Extension]) -> io::Result<(Self, u16, Vec<u8>)> {
+        match relay.ed_identity {
+            Some(ed) => {
+                let (client, skin) = NtorV3Client::new(&ed, &relay.ntor_onion_key, extensions)?;
+                Ok((
+                    Self::NtorV3(client),
+                    super::ntor_v3::HANDSHAKE_TYPE_NTOR_V3,
+                    skin,
+                ))
+            }
+            None => {
+                let (client, skin) = NtorClient::new(&relay.rsa_identity, &relay.ntor_onion_key)?;
+                Ok((Self::Ntor(client), ntor::HANDSHAKE_TYPE_NTOR, skin))
+            }
+        }
+    }
+
+    /// Check the relay's reply and derive the hop's keys, together with
+    /// whatever extensions the relay answered with.
+    fn finish(&self, reply: &[u8]) -> io::Result<(ntor::CircuitKeys, Vec<Extension>)> {
+        match self {
+            Self::Ntor(client) => Ok((client.finish(reply)?, Vec::new())),
+            Self::NtorV3(client) => client.finish(reply),
+        }
     }
 }
 
@@ -209,6 +254,15 @@ impl State {
 struct Inner {
     chan: Channel,
     circ_id: u32,
+    /// Held while a relay cell is built and handed to the channel.
+    ///
+    /// A relay checks each cell's digest against a running hash of every cell
+    /// it has received on that hop, so the order cells *arrive* in must be the
+    /// order their digests were computed in. Building under one lock and
+    /// sending under none lets two writers swap places, after which every
+    /// digest is wrong and the relay tears the circuit down with
+    /// DESTROY(PROTOCOL). This lock is taken before `state`, never after.
+    send_order: Mutex<()>,
     state: Mutex<State>,
     event: Condvar,
     streams: Mutex<HashMap<u16, Arc<StreamShared>>>,
@@ -244,6 +298,7 @@ impl Circuit {
         let inner = Arc::new(Inner {
             chan: chan.clone(),
             circ_id,
+            send_order: Mutex::new(()),
             state: Mutex::new(State {
                 hops: Vec::new(),
                 relay_early_left: MAX_RELAY_EARLY,
@@ -295,9 +350,9 @@ impl Circuit {
     }
 
     fn do_create(&self, first: &RelayInfo) -> io::Result<()> {
-        let (client, skin) = NtorClient::new(&first.rsa_identity, &first.ntor_onion_key)?;
+        let (handshake, htype, skin) = Handshake::start(first, &[])?;
         let mut body = Vec::with_capacity(4 + skin.len());
-        body.extend_from_slice(&ntor::HANDSHAKE_TYPE_NTOR.to_be_bytes());
+        body.extend_from_slice(&htype.to_be_bytes());
         body.extend_from_slice(&(skin.len() as u16).to_be_bytes());
         body.extend_from_slice(&skin);
         self.inner
@@ -305,11 +360,13 @@ impl Circuit {
             .send_cell(&Cell::new(self.inner.circ_id, cell::CMD_CREATE2, body)?)?;
 
         let reply = self.wait_for_handshake()?;
-        let keys = client.finish(&reply)?;
+        let (keys, _extensions) = handshake.finish(&reply)?;
         self.inner.state.lock().unwrap().hops.push(Hop::new(&keys));
         debug!(
-            "circuit {}: hop 1 established via {}",
-            self.inner.circ_id, first.addr
+            "circuit {}: hop 1 established via {} with {}",
+            self.inner.circ_id,
+            first.addr,
+            handshake_name(htype)
         );
         Ok(())
     }
@@ -317,20 +374,21 @@ impl Circuit {
     /// Extend the circuit by one hop with EXTEND2, which must travel in a
     /// RELAY_EARLY cell.
     pub fn extend(&self, next: &RelayInfo) -> io::Result<()> {
-        let (client, skin) = NtorClient::new(&next.rsa_identity, &next.ntor_onion_key)?;
-        let payload = build_extend2(next, &skin);
+        let (handshake, htype, skin) = Handshake::start(next, &[])?;
+        let payload = build_extend2(next, htype, &skin);
 
         let last_hop = self.last_hop()?;
         self.send_relay(last_hop, RELAY_EXTEND2, 0, &payload, true)?;
 
         let reply = self.wait_for_handshake()?;
-        let keys = client.finish(&reply)?;
+        let (keys, _extensions) = handshake.finish(&reply)?;
         self.inner.state.lock().unwrap().hops.push(Hop::new(&keys));
         debug!(
-            "circuit {}: hop {} established via {}",
+            "circuit {}: hop {} established via {} with {}",
             self.inner.circ_id,
             last_hop + 2,
-            next.addr
+            next.addr,
+            handshake_name(htype)
         );
         Ok(())
     }
@@ -466,6 +524,9 @@ impl Circuit {
         data: &[u8],
         early: bool,
     ) -> io::Result<()> {
+        // See `Inner::send_order`: the digest chain is checked in arrival
+        // order, so building and queueing must not be interleaved.
+        let _order = self.inner.send_order.lock().unwrap();
         let mut state = self.inner.state.lock().unwrap();
         let cell = build_relay_cell(
             &mut state,
@@ -549,6 +610,9 @@ impl Circuit {
     /// Send one RELAY_DATA cell, waiting for a SENDME if the circuit's package
     /// window is exhausted.
     fn send_data(&self, hop: usize, stream_id: u16, data: &[u8]) -> io::Result<()> {
+        // Wait for room *before* taking the ordering lock: a writer parked
+        // here still holding it would stop the pump sending the very SENDME
+        // that would let it go.
         let deadline = Instant::now() + SENDME_TIMEOUT;
         let mut state = self.inner.state.lock().unwrap();
         while state.package_window <= 0 {
@@ -570,6 +634,10 @@ impl Circuit {
             state = guard;
         }
         state.package_window -= 1;
+        drop(state);
+
+        let _order = self.inner.send_order.lock().unwrap();
+        let mut state = self.inner.state.lock().unwrap();
         let cell = build_relay_cell(
             &mut state,
             self.inner.circ_id,
@@ -637,14 +705,22 @@ impl From<StreamEnd> for io::Error {
 }
 
 /// Build the EXTEND2 payload: link specifiers in the order the spec asks for
-/// (IPv4, legacy identity, Ed25519 identity) then the ntor onion skin.
-fn build_extend2(next: &RelayInfo, skin: &[u8]) -> Vec<u8> {
+/// (IPv4, legacy identity, Ed25519 identity) then the onion skin.
+fn build_extend2(next: &RelayInfo, htype: u16, skin: &[u8]) -> Vec<u8> {
     let mut out = next.link_specifiers();
     out.reserve(4 + skin.len());
-    out.extend_from_slice(&ntor::HANDSHAKE_TYPE_NTOR.to_be_bytes());
+    out.extend_from_slice(&htype.to_be_bytes());
     out.extend_from_slice(&(skin.len() as u16).to_be_bytes());
     out.extend_from_slice(skin);
     out
+}
+
+fn handshake_name(htype: u16) -> &'static str {
+    match htype {
+        ntor::HANDSHAKE_TYPE_NTOR => "ntor",
+        super::ntor_v3::HANDSHAKE_TYPE_NTOR_V3 => "ntor-v3",
+        _ => "an unknown handshake",
+    }
 }
 
 /// Assemble one relay cell: digest first (over the body with the digest field
@@ -795,6 +871,11 @@ fn handle_relay(inner: &Arc<Inner>, cell: Cell) -> io::Result<()> {
         return Err(invalid_data("relay cell has the wrong body length"));
     }
 
+    // This may answer with a SENDME, so it takes the ordering lock first and
+    // in the same order every other sender does. Decryption is quick, and a
+    // writer waiting on this is a writer whose cell would otherwise have
+    // raced the acknowledgement out.
+    let _order = inner.send_order.lock().unwrap();
     let mut state = inner.state.lock().unwrap();
     let hop = match decrypt_inbound(&mut state, &mut body) {
         Some(hop) => hop,
@@ -1633,7 +1714,7 @@ mod tests {
             ed_identity: Some([0xbb; 32]),
             ntor_onion_key: [0xcc; 32],
         };
-        let payload = build_extend2(&relay, &[0x11; 84]);
+        let payload = build_extend2(&relay, ntor::HANDSHAKE_TYPE_NTOR, &[0x11; 84]);
         assert_eq!(payload[0], 3, "three link specifiers");
         assert_eq!(payload[1], 0x00, "IPv4 comes first");
         assert_eq!(payload[2], 6);

@@ -17,12 +17,6 @@
 //! `Df | Db | Kf | Kb` exactly as ntor's is, so this yields the same
 //! [`CircuitKeys`] the rest of the circuit code already knows.
 
-// Nothing wires ntor-v3 into circuit building yet -- `circuit.rs` still sends
-// HTYPE 0x0002 -- so every item here is unreachable from `main`. The module is
-// complete and tested on its own; this keeps that from being a wall of
-// dead-code warnings until the caller arrives.
-#![allow(dead_code)]
-
 use std::io;
 
 use crate::ffi::aes::Aes256Ctr;

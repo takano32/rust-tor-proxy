@@ -1034,8 +1034,23 @@ impl TorClient {
         let digests: Vec<[u8; 32]> = hsdirs.iter().map(|r| r.microdesc_digest).collect();
 
         let dir_circuit = self.dir_circuit()?;
-        let ed_ids = directory.microdesc_ed_ids(&digests, &dir_circuit);
+        let mut ed_ids = directory.microdesc_ed_ids(&digests, &dir_circuit);
         dir_circuit.close();
+
+        // A ring built from part of the network points at the wrong directory
+        // nodes and fails quietly, so a batch that did not arrive is worth one
+        // more try on a fresh circuit.
+        let missing: Vec<[u8; 32]> = digests
+            .iter()
+            .copied()
+            .filter(|d| !ed_ids.contains_key(d))
+            .collect();
+        if !missing.is_empty() && missing.len() < digests.len() {
+            crate::debug!("refetching {} missing microdescriptors", missing.len());
+            let dir_circuit = self.dir_circuit()?;
+            ed_ids.extend(directory.microdesc_ed_ids(&missing, &dir_circuit));
+            dir_circuit.close();
+        }
 
         let nodes = hsdir::build_ring(
             hsdirs
@@ -1044,10 +1059,15 @@ impl TorClient {
             &srv,
             &period,
         );
-        if nodes.is_empty() {
-            return Err(invalid_data(
-                "no HSDir in the consensus has an Ed25519 identity",
-            ));
+        // Some relays legitimately have no `id ed25519` line and cannot be
+        // placed, but a ring missing a large share of the network would send
+        // lookups to nodes that are not responsible for anything.
+        if nodes.len() * 3 < hsdirs.len() * 2 {
+            return Err(invalid_data(format!(
+                "only {} of {} HSDirs could be placed on the ring",
+                nodes.len(),
+                hsdirs.len()
+            )));
         }
         crate::info!(
             "HSDir ring ready in {:.1}s: {} of {} relays placed",

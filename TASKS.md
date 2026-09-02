@@ -1149,22 +1149,22 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
 輻輳制御の前提。この段階では拡張フィールドを空にして送り、フロー制御は window 方式のまま。
 tor-spec/create-created-cells.md の ntor-v3 節(proposal 332)を正とする。
 
-- [ ] CREATE2 / EXTEND2 の `HTYPE = 0x0003`。`ID` は **リレーの Ed25519 識別子**(microdesc の
+- [x] CREATE2 / EXTEND2 の `HTYPE = 0x0003`。`ID` は **リレーの Ed25519 識別子**(microdesc の
       `id ed25519`。無いリレーには従来の ntor を使う)、`B` は `ntor-onion-key`。
-- [ ] 記法: `ENCAP(s) = INT_8(len(s)) | s`(8 バイト big-endian、`hs::int8` と同じ)、
+- [x] 記法: `ENCAP(s) = INT_8(len(s)) | s`(8 バイト big-endian、`hs::int8` と同じ)、
       `H(s, t) = SHA3_256(ENCAP(t) | s)`、`MAC(k, msg, t) = SHA3_256(ENCAP(t) | ENCAP(k) | msg)`、
       `KDF(s, t) = SHAKE_256(ENCAP(t) | s)`、`ENC(k, m) = AES_256_CTR(k, m)`(IV 0)。
       `PROTOID = "ntor3-curve25519-sha3_256-1"`。tweak は `PROTOID | ":kdf_phase1"`、
       `":msg_mac"`、`":key_seed"`、`":verify"`、`":kdf_final"`、`":auth_final"`。
       検証文字列 `VER = "circuit create"`(arti の `NTOR3_CIRC_VERIFICATION`)。
-- [ ] クライアント側(送信):
+- [x] クライアント側(送信):
   - `x, X` を生成、`Bx = EXP(B, x)`。
   - `phase1 = KDF(Bx | ID | X | B | PROTOID | ENCAP(VER), t_msgkdf)` → `ENC_K1(32) | MAC_K1(32)`。
   - `CM`(クライアントメッセージ)= 拡張フィールド列 `N_EXT(1) | {TYPE(1) LEN(1) BODY}*`。
     M18 では `N_EXT = 0`。
   - `encrypted = ENC(ENC_K1, CM)`、`mac = MAC(MAC_K1, ID | B | X | encrypted, t_msgmac)`。
   - HDATA = `ID(32) | B(32) | X(32) | encrypted | mac(32)`。
-- [ ] クライアント側(受信 `Y(32) | AUTH(32) | encrypted_reply`):
+- [x] クライアント側(受信 `Y(32) | AUTH(32) | encrypted_reply`):
   - `secret_input = EXP(Y, x) | Bx | ID | B | X | Y | PROTOID | ENCAP(VER)`。
   - `ntor_key_seed = H(secret_input, t_key_seed)`、`verify = H(secret_input, t_verify)`。
   - `KDF(ntor_key_seed, t_final)` の先頭から `ENC_KEY(32)` を取り、残りが回路鍵の
@@ -1174,10 +1174,10 @@ tor-spec/create-created-cells.md の ntor-v3 節(proposal 332)を正とする。
   - `SM = DEC(ENC_KEY, encrypted_reply)` を拡張フィールドとして解析する(M19 で使う)。
   - **連結順は上の記述より仕様と C Tor `src/core/crypto/onion_ntor_v3.c` を優先**し、
     テストベクタで固定する。
-- [ ] `NtorClient` と同じ形の `NtorV3Client::new(id, b) / onion_skin(exts) / finish(reply) -> (CircuitKeys, Vec<Ext>)`。
+- [x] `NtorClient` と同じ形の `NtorV3Client::new(id, b) / onion_skin(exts) / finish(reply) -> (CircuitKeys, Vec<Ext>)`。
       `Circuit::create` / `extend` は `RelayInfo.ed_identity` があれば ntor-v3、無ければ ntor。
       ディレクトリ用の 1 ホップは CREATE_FAST のまま。
-- [ ] 単体テスト: C Tor `src/test/` の ntor-v3 テスト(`test_ntor_v3.c` 相当。`grep -rl ntor3 src/test/`)
+- [x] 単体テスト: C Tor `src/test/` の ntor-v3 テスト(`test_ntor_v3.c` 相当。`grep -rl ntor3 src/test/`)
       と arti `tor-proto` の `ntor_v3.rs` にある固定ベクタ(鍵と乱数を固定した往復)。無ければ
       第 II 部の hs-ntor と同様に、テスト内にサーバ側を書いて往復させる。
 - 完了条件: 3 ホップすべて ntor-v3 で `https://check.torproject.org/api/ip` が `"IsTor":true`。
