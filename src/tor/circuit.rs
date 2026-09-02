@@ -495,19 +495,29 @@ impl Circuit {
         let payload = build_extend2(next, htype, &skin);
 
         let last_hop = self.last_hop()?;
+        let sent_at = Instant::now();
         self.send_relay(last_hop, RELAY_EXTEND2, 0, &payload, true)?;
 
         let reply = self.wait_for_handshake()?;
+        // EXTEND2 to EXTENDED2 is one traversal of the whole circuit and back,
+        // with nothing beyond it involved, so for the last hop this is the
+        // circuit's round-trip time. It is the figure the flow control has to
+        // be judged against: the fixed-window scheme could never carry more
+        // than CIRCUIT_WINDOW_START cells per round trip, whatever else it did.
+        let round_trip = sent_at.elapsed();
         let (keys, answered) = handshake.finish(&reply)?;
         let mut state = self.inner.state.lock().unwrap();
         state.hops.push(Hop::new(&keys));
         drop(state);
         debug!(
-            "circuit {}: hop {} established via {} with {}",
+            "circuit {}: hop {} established via {} with {}, round trip {:.0}ms \
+             (a fixed window would cap this circuit at {} KB/s)",
             self.inner.circ_id,
             last_hop + 2,
             next.addr,
-            handshake_name(htype)
+            handshake_name(htype),
+            round_trip.as_secs_f64() * 1000.0,
+            window_ceiling_kbps(round_trip)
         );
 
         if let Some(params) = asking {
@@ -789,6 +799,11 @@ impl Circuit {
             self.inner.streams.lock().unwrap().remove(&stream_id);
             return Err(e);
         }
+        debug!(
+            "circuit {}: stream {stream_id} opened, {} on the circuit",
+            self.inner.circ_id,
+            self.open_streams()
+        );
         Ok(TorStream::new(self.clone(), shared))
     }
 
@@ -912,6 +927,13 @@ fn build_extend2(next: &RelayInfo, htype: u16, skin: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(skin.len() as u16).to_be_bytes());
     out.extend_from_slice(skin);
     out
+}
+
+/// The most the fixed-window scheme could carry on a circuit with this round
+/// trip: `CIRCUIT_WINDOW_START` cells in flight, refilled once per round trip.
+fn window_ceiling_kbps(round_trip: Duration) -> u64 {
+    let micros = round_trip.as_micros().max(1) as u64;
+    CIRCUIT_WINDOW_START as u64 * RELAY_DATA_MAX as u64 * 1_000 / micros
 }
 
 fn handshake_name(htype: u16) -> &'static str {

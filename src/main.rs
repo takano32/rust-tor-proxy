@@ -29,6 +29,10 @@ fn main() -> ExitCode {
 }
 
 fn run() -> std::io::Result<()> {
+    // Before any thread exists, so that every thread started later shares the
+    // arenas this allows.
+    ffi::malloc::limit_arenas();
+
     let config = config::Config::from_env()?;
 
     // OpenSSL is resolved at run time, so surface a missing library here

@@ -29,9 +29,11 @@ rustc は依存ゼロでも RSS 約 160MB を使うが、そのうち約 100MB �
 2. **Listen は SOCKS5**(旧 HTTP プロキシは廃止)。`SERVER_PORT` 環境変数はそのまま使う。
 3. **非同期ランタイムは使わない**。`std::thread` + ブロッキング I/O。
 4. **Tor クライアント機能は最小**: microdesc 方式の通常クライアントに加え、
-   第 II 部(§8 以降、M9〜M14)で v3 onion service の**クライアント側**を実装した。
-   bridge、PT、ntor-v3、輻輳制御(cc)、パディング交渉は対象外。onion service の
-   サービス側、クライアント認証(restricted discovery)、v2 アドレスも対象外。
+   第 II 部(§8 以降、M9〜M14)で v3 onion service の**クライアント側**を、
+   第 III 部(§16 以降、M15〜M20)で常駐運用・待ち時間短縮・ntor-v3・
+   輻輳制御(cc)を実装した。bridge、PT、パディング交渉、conflux、vanguards は
+   対象外。onion service のサービス側、クライアント認証(restricted discovery)、
+   v2 アドレスも対象外。
 5. `.cargo/config.toml` の `jobs = 1` は維持する。
 6. `Cargo.lock` は依存ゼロなので 1 パッケージだけになる。
 
@@ -47,15 +49,18 @@ rustc は依存ゼロでも RSS 約 160MB を使うが、そのうち約 100MB �
 ## 1. ゴールと非ゴール
 
 **ゴール**
-- `SERVER_PORT=9050 cargo run --release` で SOCKS5 サーバが起動し、
-  `curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip` が
-  `"IsTor":true` を返す。
+- `cargo run --release` で SOCKS5 / SOCKS4a / HTTP CONNECT を 1 ポート(既定 9050)で
+  受けるプロキシが起動し、`curl --socks5-hostname 127.0.0.1:9050
+  https://check.torproject.org/api/ip` が `"IsTor":true` を返す。
 - ビルドが `systemd-run --user --scope -p MemoryMax=200M -p MemorySwapMax=0 cargo build --release` で通る。
 - 実行時 RSS が 60MB 未満(目標 30MB 台)。
 
 **非ゴール**
-- Tor Browser 相当の匿名性。ガード選択・経路重み付けは簡略化する(後述)。
-- IPv6 のみの環境、onion サービス、bridge、DNS の RESOLVE セル。
+- Tor Browser 相当の匿名性。ガード運用は簡略化する(第 III 部で最大 3 台の
+  優先順リストにしたが、サンプル集合も交代スケジュールも無い)。
+  経路重み付けは第 III 部で `bandwidth-weights` を実装済み。
+- IPv6 のみの環境、bridge、DNS の RESOLVE セル。onion サービスは
+  第 II 部でクライアント側のみ実装した。
 
 ---
 
@@ -1231,13 +1236,13 @@ C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
 
 ### M20. 仕上げ
 
-- [ ] README: 計測表を更新する(§20 の項目)。Limitations に「複数回路に分散するので出口が増える」
+- [x] README: 計測表を更新する(§20 の項目)。Limitations に「複数回路に分散するので出口が増える」
       「楽観応答により失敗が SOCKS コードでなく切断で見える」を追記。「Not implemented」から
       「congestion control」「consensus diffs or compression」を外す。SOCKS4a と HTTP CONNECT の
       使い方、`SERVER_PORT` の既定を追記。
-- [ ] `TASKS.md` §0.2 の決定事項 4 と §1 の非ゴールを第 III 部の結果に同期する。
+- [x] `TASKS.md` §0.2 の決定事項 4 と §1 の非ゴールを第 III 部の結果に同期する。
       末尾に「§23 実装状況(第 III 部)」を第 I・II 部と同じ形式で書く。
-- [ ] `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、§5 のメモリ検証。
+- [x] `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、§5 のメモリ検証。
       実行時 VmHWM は **35MB 未満**を維持する(現状 26.5MB + 常駐回路 3 本 + zlib)。
 - 完了条件: README の表がすべて実測で埋まっている。
 
@@ -1331,3 +1336,81 @@ grep -E 'VmHWM' /proc/$!/status; du -sh state
   捨てられるなら、onion だけ CONNECTED 待ちに戻す(M16 の完了条件で確認)。
 - **メモリ**: 常駐回路 3 本と zlib、diff 適用中の本文 2 つぶんで数 MB 増える。
   目標 35MB 未満、上限 60MB は第 I 部のまま。
+
+---
+
+## 23. 実装状況(第 III 部、2026-09-03 完了)
+
+M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実機テスト 8 件、
+`cargo clippy --all-targets -- -D warnings` と `cargo fmt --check` がいずれも通る。
+`MemoryMax=200M` でのリリースビルドは 26 秒で成功、バイナリ 1.4MB。
+
+§20 の計測表に対する結果(すべて aarch64 / OpenSSL 3.6.4 / 実ネットワーク):
+
+| 項目 | 現状(第 II 部) | 目標 | 実測 |
+|---|---|---|---|
+| 冷えた bootstrap → listening | 13〜27 秒 | 10 秒以内 | **7〜9 秒** |
+| 温かい bootstrap | ほぼ 0 | 変わらず | 1.4 秒 |
+| ready 後の初回接続: 先頭バイトまで | 未計測 | 2 秒以内 | **0.95 秒** |
+| 2 本目以降: TLS 確立まで | 未計測 | 約 1 往復短い | 0.49 秒 |
+| `.onion` 初回(冷) | 51 秒 | 20 秒 | **12〜15 秒** |
+| `.onion` 2 回目 | 1.2 秒 | 1 秒台 | **0.4〜0.6 秒** |
+| 単一ストリーム 10MB | 410KB/s 相当 | window の 2 倍以上 | **判定不能**(下記) |
+| 4 並列 2MB の合計 | 未計測 | 単一の 3 倍以上 | **1514KB/s(単一 340KB/s の 4.4 倍)** |
+| 4 時間連続稼働後のコンセンサス更新 | 無し | diff で更新 | 304 / diff 経路とも実機で確認 |
+| VmHWM | 26.5MB | 35MB 未満 | **17.3MB**(onion 訪問後 **31.4MB**) |
+| `state/` の容量 | 増え続ける | 安定 | 剪定で 4.1MB / onion 後 25MB で安定 |
+
+計画から意図的に外した点、および計画になかった追加は次のとおり。
+
+1. **単一ストリームの 2 倍は「達成できなかった」ではなく「この経路では検証できない」**。
+   1 本のストリームの速度はどの中継を引いたかでほぼ決まり、同じ回路を 2 方式で
+   走らせることはできないので、ビルドを交互に回す比較(cc 689KB/s 対 window
+   381KB/s)は回路の当たり外れと交絡していて、方式の証拠にならない。
+   回路ごとに判定できる形にするため、EXTEND2 → EXTENDED2 の往復時間を回路構築時に
+   ログへ出すようにした(これは回路全体をちょうど 1 往復し、宛先は関与しない)。
+   window 方式の上限は `1000 セル × 498B ÷ RTT` なので、この上限と実測を突き合わせられる。
+   RTT 316ms / 334ms の 2 回路で 30MB を 8 回流したところ、上限は 1576 / 1488KB/s、
+   実測は 577〜1449KB/s で、**8 回すべてが自分の回路の上限を下回った**。
+   つまりこの経路では window 方式が律速ではなく、cc に伸ばす余地が無い。
+   cc を入れた理由は速度ではなく、(a) コンセンサスの `required-relay-protocols` が
+   すでに `FlowCtrl=1-2` であり必須化されうること、(b) RTT × 帯域が 1000 セルを
+   超える回路では効くこと、の 2 点である。100MB 連続転送(20 万セル、SENDME 約 6500 回)は
+   1054KB/s で DESTROY も警告も無く完走した。
+2. **`.z` ではなく `Accept-Encoding: deflate`**。dir-spec/standards-compliance.md は
+   「クライアントは `.z` URL を要求すべきでない」「匿名要求では deflate 以外を
+   広告すべきでない」と書いている。1 本の値で両方を満たせるので、TASKS の
+   `.z` 案ではなくヘッダ方式にした。
+3. **`X-Or-Diff-From-Consensus` のダイジェストは署名部のみ**。TASKS §M15 は
+   「手元のコンセンサス本文の SHA3-256」と書いていたが、dir-spec は
+   「`directory-signature<SPACE>` までの署名部」と定める。全文のダイジェストを
+   送るとサーバは diff を返さない。また、手元が最新のときサーバは **304** を返す。
+   これを失敗として扱うと 3.6MB を無駄に取り直すので、結果として扱う。
+4. **リレーセルの送信順序が壊れていた**(第 I・II 部から潜在)。セルをロック内で
+   組み立ててロック解放後に送っていたため、並行 writer で順序が入れ替わると
+   ダイジェスト鎖が合わなくなり、中継が `DESTROY(PROTOCOL)` を返す。
+   第 III 部で入れたディレクトリの並列取得とストリーム分散が、この潜在バグを
+   踏むようにした。送信順序専用のロックを導入し、writer も pump も同じ順序
+   (send_order → state)で取るようにした。writer は窓待ちを先に済ませてから
+   取るので、待っている間に順序ロックを握り続けることはない。
+5. **`RESOLVEFAILED` も別回路で再試行する**。TASKS §M16 は「宛先の問題なので
+   再試行しない」としていたが、resolver の壊れた出口は実際に存在し(最初の
+   スループット計測で 1 本引いた)、それは宛先ではなく出口の問題である。
+   C Tor も再試行する。`CONNECTREFUSED` だけはそのまま返す。
+6. **glibc の malloc アリーナを 2 に制限した**(計画外)。スレッドごとにアリーナが
+   増えると、実データが数 MB でも RSS が 55MB まで膨らんだ。`mallopt(M_ARENA_MAX, 2)`
+   を起動時に呼ぶだけで onion 訪問後 31.4MB に下がる。musl には `mallopt` が無いので
+   OpenSSL と同じく実行時に `dlsym` で探し、無ければ何もしない。
+7. **HSDir リングは全体の 2/3 未満しか置けなければ拒否する**(計画外)。並列取得が
+   失敗するとリングが一部だけで構築され、担当外のノードに問い合わせて静かに
+   失敗する。取り逃したバッチは新しい回路で 1 度だけ取り直す。
+8. **onion service の cc は単体テストのみ**。テストに使える onion service で
+   `flow-control` 行を publish しているものが見つからなかった
+   (`2gzyxa5…wid.onion` は `create2-formats 2` のみで、この行が無い)。
+   descriptor に行が無ければ window 方式、というのが仕様どおりの動作である。
+9. **`sendme-inc` が範囲外の descriptor は「拒否」ではなく window 方式に落とす**。
+   proposal 324 §9.1 は descriptor を拒否せよと書くが、拡張を送らなければ
+   サービス側も cc を使わないので、両者は整合したまま接続できる。
+10. **回路プールは stub(2 ホップ)+ clean 1 本**。同時ストリームは 4 回路まで
+    分散し、それ以降は 1 回路 4 ストリームまで共有する。定数は
+    `SPREAD_CIRCUITS` / `STREAMS_PER_CIRCUIT`。

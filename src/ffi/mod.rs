@@ -37,6 +37,7 @@ pub mod aes;
 pub mod ed25519;
 pub mod hash;
 pub mod hmac;
+pub mod malloc;
 pub mod rand;
 pub mod rsa;
 pub mod tls;
