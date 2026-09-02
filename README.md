@@ -1,4 +1,4 @@
-# sorahost-tor-proxy
+# rust-tor-proxy
 
 A dependency-free Tor client with a SOCKS5 listener, written in Rust.
 
@@ -80,7 +80,7 @@ Reproduce the build and runtime figures with:
 systemd-run --user --scope -q -p MemoryMax=200M -p MemorySwapMax=0 \
     cargo build --release -j1
 
-SERVER_PORT=9050 ./target/release/sorahost-tor-proxy &
+SERVER_PORT=9050 ./target/release/rust-tor-proxy &
 grep -E 'VmRSS|VmHWM' /proc/$!/status
 ```
 

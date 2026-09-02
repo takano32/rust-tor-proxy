@@ -1,5 +1,5 @@
 [package]
-name = "sorahost-tor-proxy"
+name = "rust-tor-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "A dependency-free Tor client exposing a SOCKS5 listener"
