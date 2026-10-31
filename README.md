@@ -89,6 +89,15 @@ out which of them hold the service's descriptor. Onion addresses appear in the
 log only at `TOR_LOG=debug`, so that an ordinary log does not record which
 services were visited.
 
+## Production
+
+The production instance listens on `3950x-tokyo.sorahost.net:63320`, serving
+the same three protocols on that one port:
+
+```sh
+curl --socks5-hostname 3950x-tokyo.sorahost.net:63320 https://check.torproject.org/api/ip
+```
+
 ## Measured
 
 On aarch64 with Rust 1.96 and OpenSSL 3.6.4, against the live Tor network.
