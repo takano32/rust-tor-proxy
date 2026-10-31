@@ -22,7 +22,6 @@ const VERSION_LINE: &str = "network-status-diff-version 1";
 /// Every failure is an error and never a panic: a diff arrives from a relay we
 /// have not authenticated, and the caller's answer to any complaint here is
 /// simply to fetch the whole consensus instead.
-#[allow(dead_code)] // Called from the consensus fetch path by the rest of M15.
 pub fn apply(base: &str, diff: &str) -> io::Result<String> {
     let (diff_lines, _) = split_lines(diff);
     if diff_lines.first() != Some(&VERSION_LINE) {

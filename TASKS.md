@@ -1,57 +1,67 @@
-# TASKS.md — 依存ゼロ Tor クライアント + SOCKS5 プロキシ 実装計画
+# TASKS.md — 依存ゼロ Tor クライアント + SOCKS5 プロキシ
 
-対象読者: この計画をそのまま実装する AI エージェント(Opus 5 など)および人間の開発者。
-このファイルは「何を・どの順で・どう確認しながら」作るかを定義する。仕様の詳細は
+対象読者: このタスクをそのまま実装する AI エージェントおよび人間の開発者。
+このファイルはタスクだけで構成する。「何を・どの順で・どう確認しながら」作るかは、
+すべてタスク(T.xx とその子孫)の中に書く。仕様の詳細は
 `spec.torproject.org` を正とし、本書には実装に必要な要点と落とし穴だけを書く。
 
 ---
 
-## タスク番号(T.xx)
+## タスク番号
 
-タスクは階層つきの番号で呼ぶ。**0 埋めはしない**(`T.1.2` であって `T.01.02` ではない)。
+このファイルにある概念はタスクだけである。タスクは階層つきの番号で呼び、
+**0 埋めはしない**(`T.1.2` であって `T.01.02` ではない)。
 
-- **T.xx**: マイルストーン。番号はマイルストーンの番号と同じ(`T.15` = M15)。
-- **T.xx.yy**: マイルストーン内のタスク(チェックリストの 1 項目)。
-- **T.xx.yy.zz**: 孫タスク。1 項目をさらに分けて追いたいときだけ使う。項目の下の
-  ただの箇条書き(仕様の要点・手順のメモ)は番号を持たない。
+- **T.xx**: タスク。
+- **T.xx.yy**: その子タスク。
+- **T.xx.yy.zz**: 孫タスク。
 
-番号は一度振ったら変えない(削除・並べ替えをしても欠番のままにする)。新しいタスクは
-該当するマイルストーンの末尾の続きから、新しいマイルストーンなら次の番号(現在の最大は
-**T.21**)から採番する。未着手は `- [ ]`、完了は `- [x]` とする。コミットメッセージや
-議論では `T.xx.yy` で参照する。
+チェックボックスの付いた項目が作業の単位で、未着手は `- [ ]`、完了は `- [x]` とする。
+見出しになっているタスクは、子孫がすべて `[x]` になったら完了。タスクの下にある番号の無い
+節(背景、決定事項、FFI 関数一覧、リスク、実装状況など)と箇条書きは、そのタスクの説明である。
 
-| 番号 | マイルストーン | 内容 | タスク | 状態 |
-|---|---|---|---|---|
-| T.0 | M0 | 土台の整理 | T.0.1〜T.0.4 | 完了 |
-| T.1 | M1 | OpenSSL FFI 層 | T.1.1〜T.1.11 | 完了 |
-| T.2 | M2 | セルとリンクハンドシェイク | T.2.1〜T.2.6 | 完了 |
-| T.3 | M3 | ntor と 1 ホップ回路 | T.3.1〜T.3.7 | 完了 |
-| T.4 | M4 | ディレクトリ取得と検証 | T.4.1〜T.4.8 | 完了 |
-| T.5 | M5 | 3 ホップ回路と経路選択 | T.5.1〜T.5.4 | 完了 |
-| T.6 | M6 | ストリームとフロー制御 | T.6.1〜T.6.5 | 完了 |
-| T.7 | M7 | SOCKS5 サーバ | T.7.1〜T.7.5 | 完了 |
-| T.8 | M8 | 仕上げ(第 I 部) | T.8.1〜T.8.4 | 完了 |
-| T.9 | M9 | 暗号プリミティブの追加 | T.9.1〜T.9.8 | 完了 |
-| T.10 | M10 | アドレス・時刻周期・HSDir リング | T.10.1〜T.10.9 | 完了 |
-| T.11 | M11 | 終端指定の 3 ホップ回路と descriptor | T.11.1〜T.11.8 | 完了 |
-| T.12 | M12 | 回路の一般化と hs-ntor | T.12.1〜T.12.8 | 完了 |
-| T.13 | M13 | Rendezvous と Introduce | T.13.1〜T.13.5 | 完了 |
-| T.14 | M14 | SOCKS5 統合と仕上げ(第 II 部) | T.14.1〜T.14.5 | 完了 |
-| T.15 | M15 | 常駐化 | T.15.1〜T.15.8 | 完了 |
-| T.16 | M16 | 待ち時間ゼロ化 | T.16.1〜T.16.7 | 完了 |
-| T.17 | M17 | SOCKS4a、HTTP CONNECT、既定ポート | T.17.1〜T.17.7 | 完了 |
-| T.18 | M18 | ntor-v3 | T.18.1〜T.18.6 | 完了 |
-| T.19 | M19 | 輻輳制御 | T.19.1〜T.19.7 | 完了 |
-| T.20 | M20 | 仕上げ(第 III 部) | T.20.1〜T.20.3 | 完了 |
-| T.21 | M21 | 速い経路の自動選択(§24.8) | T.21.1〜T.21.10 | 完了 |
+番号は一度振ったら変えない(削除・並べ替えをしても欠番のままにする)。新しい作業は、
+関係するタスクの子の末尾の続きから、どこにも属さなければ次のトップレベル(現在の最大は
+**T.4**)から採番する。やることはすべてこのファイルに書き、別のファイルには分けない。
+コミットメッセージや議論では番号で参照する。
 
-未着手のタスクは現在無い。
+| 番号 | タスク | 子孫 | 状態 |
+|---|---|---|---|
+| T.1 | 依存ゼロ Tor クライアント + SOCKS5 プロキシ |  | 完了 |
+| T.1.1 | 土台の整理 | T.1.1.1〜T.1.1.4 | 完了 |
+| T.1.2 | OpenSSL FFI 層 | T.1.2.1〜T.1.2.11 | 完了 |
+| T.1.3 | セルとリンクハンドシェイク | T.1.3.1〜T.1.3.6 | 完了 |
+| T.1.4 | ntor と 1 ホップ回路 | T.1.4.1〜T.1.4.7 | 完了 |
+| T.1.5 | ディレクトリ取得と検証 | T.1.5.1〜T.1.5.8 | 完了 |
+| T.1.6 | 3 ホップ回路と経路選択 | T.1.6.1〜T.1.6.4 | 完了 |
+| T.1.7 | ストリームとフロー制御 | T.1.7.1〜T.1.7.5 | 完了 |
+| T.1.8 | SOCKS5 サーバ | T.1.8.1〜T.1.8.5 | 完了 |
+| T.1.9 | 仕上げ | T.1.9.1〜T.1.9.4 | 完了 |
+| T.2 | Onion service(v3)クライアント |  | 未完了 1 件 |
+| T.2.1 | 暗号プリミティブの追加 | T.2.1.1〜T.2.1.8 | 完了 |
+| T.2.2 | アドレス・時刻周期・HSDir リング | T.2.2.1〜T.2.2.9 | 完了 |
+| T.2.3 | 終端指定の 3 ホップ回路と descriptor | T.2.3.1〜T.2.3.9 | **T.2.3.9 が未着手** |
+| T.2.4 | 回路の一般化と hs-ntor | T.2.4.1〜T.2.4.8 | 完了 |
+| T.2.5 | Rendezvous と Introduce | T.2.5.1〜T.2.5.5 | 完了 |
+| T.2.6 | SOCKS5 統合と仕上げ | T.2.6.1〜T.2.6.5 | 完了 |
+| T.3 | 速くて手軽な常駐プロキシ |  | 完了 |
+| T.3.1 | 常駐化 | T.3.1.1〜T.3.1.8 | 完了 |
+| T.3.2 | 待ち時間ゼロ化 | T.3.2.1〜T.3.2.7 | 完了 |
+| T.3.3 | SOCKS4a、HTTP CONNECT、既定ポート | T.3.3.1〜T.3.3.7 | 完了 |
+| T.3.4 | ntor-v3 | T.3.4.1〜T.3.4.6 | 完了 |
+| T.3.5 | 輻輳制御 | T.3.5.1〜T.3.5.7 | 完了 |
+| T.3.6 | 仕上げ | T.3.6.1〜T.3.6.3 | 完了 |
+| T.4 | 速い経路の自動選択 | T.4.1〜T.4.10 | 完了 |
+
+未着手: **T.2.3.9**。
 
 ---
 
-## 0. 背景と決定事項
+## T.1 依存ゼロ Tor クライアント + SOCKS5 プロキシ
 
-### 0.1 なぜ arti を捨てるのか(実測結果)
+### T.1 背景と決定事項
+
+#### なぜ arti を捨てるのか(実測結果)
 
 | 構成 | 依存クレート数 | 240MB cgroup 制限下のビルド | 備考 |
 |---|---|---|---|
@@ -65,22 +75,22 @@ rustc は依存ゼロでも RSS 約 160MB を使うが、そのうち約 100MB �
 (ファイルバックのページ)で、メモリ逼迫時にカーネルが回収できる。したがって
 **「依存ゼロ + libssl/libcrypto への手書き FFI」なら 128〜200MB 環境でも `cargo run` できる**。
 
-### 0.2 決定事項
+#### 決定事項
 
 1. **外部クレートは使わない**(`[dependencies]` を空にする)。暗号と TLS はシステムの
    OpenSSL 3(`libssl.so.3` / `libcrypto.so.3`)へ `extern "C"` で直接リンクする。build.rs も不要。
 2. **Listen は SOCKS5**(旧 HTTP プロキシは廃止)。`SERVER_PORT` 環境変数はそのまま使う。
 3. **非同期ランタイムは使わない**。`std::thread` + ブロッキング I/O。
 4. **Tor クライアント機能は最小**: microdesc 方式の通常クライアントに加え、
-   第 II 部(§8 以降、M9〜M14)で v3 onion service の**クライアント側**を、
-   第 III 部(§16 以降、M15〜M20)で常駐運用・待ち時間短縮・ntor-v3・
+   T.2 で v3 onion service の**クライアント側**を、
+   T.3 で常駐運用・待ち時間短縮・ntor-v3・
    輻輳制御(cc)を実装した。bridge、PT、パディング交渉、conflux、vanguards は
    対象外。onion service のサービス側、クライアント認証(restricted discovery)、
    v2 アドレスも対象外。
 5. `.cargo/config.toml` の `jobs = 1` は維持する。
 6. `Cargo.lock` は依存ゼロなので 1 パッケージだけになる。
 
-### 0.3 対象環境の前提
+#### 対象環境の前提
 
 - Linux、メモリ 128〜240MB、swap の有無は問わない。
 - `libssl.so.3` と `libcrypto.so.3` が存在すること(ヘッダは不要)。
@@ -89,7 +99,7 @@ rustc は依存ゼロでも RSS 約 160MB を使うが、そのうち約 100MB �
 
 ---
 
-## 1. ゴールと非ゴール
+### T.1 ゴールと非ゴール
 
 **ゴール**
 - `cargo run --release` で SOCKS5 / SOCKS4a / HTTP CONNECT を 1 ポート(既定 9050)で
@@ -99,15 +109,15 @@ rustc は依存ゼロでも RSS 約 160MB を使うが、そのうち約 100MB �
 - 実行時 RSS が 60MB 未満(目標 30MB 台)。
 
 **非ゴール**
-- Tor Browser 相当の匿名性。ガード運用は簡略化する(第 III 部で最大 3 台の
+- Tor Browser 相当の匿名性。ガード運用は簡略化する(T.3で最大 3 台の
   優先順リストにしたが、サンプル集合も交代スケジュールも無い)。
-  経路重み付けは第 III 部で `bandwidth-weights` を実装済み。
+  経路重み付けはT.3で `bandwidth-weights` を実装済み。
 - IPv6 のみの環境、bridge、DNS の RESOLVE セル。onion サービスは
-  第 II 部でクライアント側のみ実装した。
+  T.2でクライアント側のみ実装した。
 
 ---
 
-## 2. アーキテクチャ
+### T.1 アーキテクチャ
 
 ```
 src/
@@ -151,33 +161,33 @@ src/
 
 ---
 
-## 3. マイルストーン
+### T.1 進め方
 
-各マイルストーンは「完了条件」を満たしたらコミットする。
-コミット前に必ず §5 のメモリ検証コマンドを実行し、結果をコミットメッセージに書く。
+子タスク(T.1.1〜T.1.9)は「完了条件」を満たしたらコミットする。
+コミット前に必ず T.1 の検証コマンドでメモリ検証を実行し、結果をコミットメッセージに書く。
 
-### M0. 土台の整理(T.0)
+### T.1.1 土台の整理
 
-- [x] **T.0.1** `git rm` で `src/http.rs`、`src/server.rs` を削除。`Cargo.toml` の `[dependencies]` を空にし、
+- [x] **T.1.1.1** `git rm` で `src/http.rs`、`src/server.rs` を削除。`Cargo.toml` の `[dependencies]` を空にし、
       `async-std` / `arti-client` / `tor-rtcompat` / `futures-util` を消す。`cargo update` で lock を再生成。
-- [x] **T.0.2** `src/main.rs`、`src/config.rs`、`src/relay.rs` を b79359b 時点の同期版(std::io)に戻す。
+- [x] **T.1.1.2** `src/main.rs`、`src/config.rs`、`src/relay.rs` を b79359b 時点の同期版(std::io)に戻す。
       `git show b79359b:src/relay.rs` などで取得できる。
-- [x] **T.0.3** `Cargo.toml` に以下を追加(rustc のメモリを増やさない設定):
+- [x] **T.1.1.3** `Cargo.toml` に以下を追加(rustc のメモリを増やさない設定):
       ```toml
       [profile.release]
       debug = 0
       [profile.dev]
       debug = 0
       ```
-- [x] **T.0.4** README を SOCKS5 前提に書き換える(`--socks5-hostname` / `ALL_PROXY=socks5h://` の例)。
+- [x] **T.1.1.4** README を SOCKS5 前提に書き換える(`--socks5-hostname` / `ALL_PROXY=socks5h://` の例)。
 - 完了条件: `cargo build` が依存ゼロで通る(まだ何もしない main で可)。
 
-### M1. OpenSSL FFI 層(`src/ffi/`)(T.1)
+### T.1.2 OpenSSL FFI 層(`src/ffi/`)
 
-- [x] **T.1.1** `#[link(name = "ssl")]` と `#[link(name = "crypto")]` を付けた `extern "C"` ブロックを書く。
-      必要な関数は §4 の一覧。型は `*mut c_void` で十分(opaque)。
-- [x] **T.1.2** `Drop` で必ず `*_free` を呼ぶ安全ラッパを作る。生ポインタを外に漏らさない。
-- [x] **T.1.3** `SslStream`:
+- [x] **T.1.2.1** `#[link(name = "ssl")]` と `#[link(name = "crypto")]` を付けた `extern "C"` ブロックを書く。
+      必要な関数は T.1 の FFI 関数一覧。型は `*mut c_void` で十分(opaque)。
+- [x] **T.1.2.2** `Drop` で必ず `*_free` を呼ぶ安全ラッパを作る。生ポインタを外に漏らさない。
+- [x] **T.1.2.3** `SslStream`:
   - `SSL_CTX_new(TLS_client_method())`、`SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)`
     (リレーの TLS 証明書は自己署名。真正性は CERTS セルで検証する)。
   - `SSL_set_fd` に `TcpStream::as_raw_fd()` を渡す。`TcpStream` は所有して drop 順を守る。
@@ -186,36 +196,36 @@ src/
   - `std::io::Read` / `Write` を実装。`SSL_read` が 0 以下なら `SSL_get_error` で
     `SSL_ERROR_ZERO_RETURN`(=6) を EOF、それ以外をエラーにする。
   - read/write タイムアウトは `TcpStream::set_read_timeout` で入れる。
-- [x] **T.1.4** ハッシュ: `EVP_sha1()` / `EVP_sha256()` one-shot(`EVP_Digest`)と
+- [x] **T.1.2.4** ハッシュ: `EVP_sha1()` / `EVP_sha256()` one-shot(`EVP_Digest`)と
       running digest(`EVP_MD_CTX_new` / `EVP_DigestInit_ex` / `EVP_DigestUpdate` /
       `EVP_MD_CTX_copy_ex` + `EVP_DigestFinal_ex` で「途中状態の値を取り出しつつ継続」)。
-- [x] **T.1.5** HMAC-SHA256: `HMAC()` one-shot。
-- [x] **T.1.6** AES-128-CTR: `EVP_CIPHER_CTX_new`、`EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), null, key, iv=全0)`、
+- [x] **T.1.2.5** HMAC-SHA256: `HMAC()` one-shot。
+- [x] **T.1.2.6** AES-128-CTR: `EVP_CIPHER_CTX_new`、`EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), null, key, iv=全0)`、
       `EVP_EncryptUpdate` を繰り返す(キーストリームは呼び出しをまたいで連続する。
       復号も同じ EncryptUpdate でよい)。
-- [x] **T.1.7** X25519: `EVP_PKEY_keygen`(id `EVP_PKEY_X25519` = 1034)、
+- [x] **T.1.2.7** X25519: `EVP_PKEY_keygen`(id `EVP_PKEY_X25519` = 1034)、
       `EVP_PKEY_get_raw_public_key`、`EVP_PKEY_new_raw_public_key`、
       `EVP_PKEY_derive_init` / `EVP_PKEY_derive_set_peer` / `EVP_PKEY_derive`。
-- [x] **T.1.8** Ed25519 検証: `EVP_PKEY_new_raw_public_key`(id `EVP_PKEY_ED25519` = 1087)、
+- [x] **T.1.2.8** Ed25519 検証: `EVP_PKEY_new_raw_public_key`(id `EVP_PKEY_ED25519` = 1087)、
       `EVP_DigestVerifyInit(ctx, null, null, null, pkey)`、`EVP_DigestVerify(ctx, sig, 64, msg, len)`。
-- [x] **T.1.9** RSA 検証: PEM `-----BEGIN RSA PUBLIC KEY-----`(PKCS#1 RSAPublicKey)を base64 デコードし、
+- [x] **T.1.2.9** RSA 検証: PEM `-----BEGIN RSA PUBLIC KEY-----`(PKCS#1 RSAPublicKey)を base64 デコードし、
       `d2i_PublicKey(EVP_PKEY_RSA=6, null, &ptr, len)` で EVP_PKEY 化。
       署名検証は **`EVP_PKEY_verify_recover`**(`EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING=1)`)
       で復元したバイト列と、自分で計算したダイジェストを**そのまま**比較する。
       Tor の署名は PKCS#1 v1.5 パディングだが **DigestInfo(OID)を含まない**ので
       `EVP_PKEY_verify` は使えない(dir-spec/netdoc.md「The signature does not include the algorithmIdentifier」)。
-- [x] **T.1.10** `RAND_bytes`。
-- [x] **T.1.11** 単体テスト: SHA-256("abc")、HMAC の RFC 4231 ベクタ、AES-128-CTR の NIST SP800-38A F.5.1、
+- [x] **T.1.2.10** `RAND_bytes`。
+- [x] **T.1.2.11** 単体テスト: SHA-256("abc")、HMAC の RFC 4231 ベクタ、AES-128-CTR の NIST SP800-38A F.5.1、
       X25519 の RFC 7748 §6.1、Ed25519 の RFC 8032 §7.1 テスト 1。
 - 完了条件: `cargo test` が通り、`-p MemoryMax=200M` でビルドが通る。
 
-### M2. セルとリンクハンドシェイク(`cell.rs`, `certs.rs`, `channel.rs`)(T.2)
+### T.1.3 セルとリンクハンドシェイク(`cell.rs`, `certs.rs`, `channel.rs`)
 
-- [x] **T.2.1** セル形式(tor-spec/cell-packet-format.md):
+- [x] **T.1.3.1** セル形式(tor-spec/cell-packet-format.md):
   - 固定長: `CircID(4) | Command(1) | Payload(509)`。可変長: `CircID | Command(1) | Length(2) | Body`。
   - VERSIONS(7)と Command ≥ 128 が可変長。**VERSIONS 送受信時のみ CircID は 2 バイト**、
     リンク v4 以降に合意した後は 4 バイト。
-- [x] **T.2.2** ハンドシェイク手順(tor-spec/negotiating-channels.md):
+- [x] **T.1.3.2** ハンドシェイク手順(tor-spec/negotiating-channels.md):
   1. TLS 接続。
   2. VERSIONS を送る(本体は `00 03 00 04` = v3, v4。v5 はパディング交渉が絡むので送らない)。
   3. 相手の VERSIONS を受け、共通最大を選ぶ(v4 を期待)。
@@ -223,25 +233,25 @@ src/
      (クライアントは認証しない)。
   5. NETINFO を返す: `TIME=00000000 | OTHERADDR(type 4, len 4, 相手 IPv4) | NMYADDR=0`。
      タイムスタンプ 0 とアドレス省略は仕様で推奨されている(フィンガープリント回避)。
-- [x] **T.2.3** CERTS の検証(negotiating-channels.md「Authenticating the responder」):
+- [x] **T.1.3.3** CERTS の検証(negotiating-channels.md「Authenticating the responder」):
   - CertType 4(IDENTITY_V_SIGNING)がちょうど 1 つ。自己署名で、拡張 type 4
     (signed-with-ed25519-key)の 32 バイト鍵 = `KP_relayid_ed`。subject = `KP_relaysign_ed`。
   - CertType 5(SIGNING_V_TLS_CERT)がちょうど 1 つ。`KP_relaysign_ed` で署名され、
     subject(32 バイト)が **TLS ピア証明書 DER の SHA-256** と一致すること。
   - 両方とも署名が正しく、期限切れでないこと(EXPIRATION は epoch からの**時間**単位)。
   - `KP_relayid_ed` が、コンセンサス/microdesc から期待した Ed25519 識別子と一致すること。
-- [x] **T.2.4** Ed25519 証明書のバイナリ形式(cert-spec.md): `VERSION(1)=1 | CERT_TYPE(1) | EXPIRATION(4) |
+- [x] **T.1.3.4** Ed25519 証明書のバイナリ形式(cert-spec.md): `VERSION(1)=1 | CERT_TYPE(1) | EXPIRATION(4) |
       CERT_KEY_TYPE(1) | CERTIFIED_KEY(32) | N_EXT(1) | {ExtLen(2) ExtType(1) ExtFlags(1) ExtData}* | SIG(64)`。
       署名対象は SIG を除く全体。
-- [x] **T.2.5** reader スレッド: セルを読み、CircID 0 のもの(PADDING 0、VPADDING 128 など)は捨て、
+- [x] **T.1.3.5** reader スレッド: セルを読み、CircID 0 のもの(PADDING 0、VPADDING 128 など)は捨て、
       それ以外は登録済み circuit に転送。未知の CircID は捨てる。
-- [x] **T.2.6** 完了条件(結合テスト、要ネットワーク): フォールバックリレー 1 台に接続し、
+- [x] **T.1.3.6** 完了条件(結合テスト、要ネットワーク): フォールバックリレー 1 台に接続し、
       CERTS 検証まで成功したらログに Ed25519 識別子を出す。
       `cargo test -- --ignored` で実行できる形にする。
 
-### M3. ntor と 1 ホップ回路(`ntor.rs`, `circuit.rs`)(T.3)
+### T.1.4 ntor と 1 ホップ回路(`ntor.rs`, `circuit.rs`)
 
-- [x] **T.3.1** ntor(tor-spec/create-created-cells.md):
+- [x] **T.1.4.1** ntor(tor-spec/create-created-cells.md):
   - `PROTOID = "ntor-curve25519-sha256-1"`、`t_mac = PROTOID|":mac"`、`t_key = PROTOID|":key_extract"`、
     `t_verify = PROTOID|":verify"`、`m_expand = PROTOID|":key_expand"`。
   - 送信 onion skin: `NODEID(20, リレーの RSA 識別子 SHA-1) | KEYID(32, ntor-onion-key B) | X(32)`。
@@ -253,9 +263,9 @@ src/
   - KDF-RFC5869(tor-spec/setting-circuit-keys.md): `K_1 = HMAC(KEY_SEED, m_expand|0x01)`、
     `K_(i+1) = HMAC(KEY_SEED, K_i|m_expand|INT8(i+1))`。先頭から
     `Df(20) | Db(20) | Kf(16) | Kb(16)` を取る(残りは捨てる)。
-- [x] **T.3.2** CREATE2(10): `HTYPE=0x0002 | HLEN=84 | HDATA`。CREATED2(11): `HLEN | HDATA`。
-- [x] **T.3.3** CircID: リンク v4 ではコネクションの開始側(=自分)が **MSB=1** の値を選ぶ。0 は禁止。
-- [x] **T.3.4** RELAY セル本体(509 バイト、tor-spec/relay-cells.md):
+- [x] **T.1.4.2** CREATE2(10): `HTYPE=0x0002 | HLEN=84 | HDATA`。CREATED2(11): `HLEN | HDATA`。
+- [x] **T.1.4.3** CircID: リンク v4 ではコネクションの開始側(=自分)が **MSB=1** の値を選ぶ。0 は禁止。
+- [x] **T.1.4.4** RELAY セル本体(509 バイト、tor-spec/relay-cells.md):
       `RelayCmd(1) | Recognized(2)=0 | StreamID(2) | Digest(4) | Length(2) | Data | Padding(0 埋め)`。
   - 送信: Digest を 0 にした 509 バイトで Df の running SHA-1 を更新し、その時点の
     ダイジェスト先頭 4 バイトを Digest に入れる。次に **hop N から hop 1 の順に** Kf で暗号化。
@@ -263,52 +273,52 @@ src/
     ダイジェスト先頭 4 バイトが一致すれば認識。一致しなければ次 hop の Kb で続ける。
     **一致しなかった場合は Db の状態を巻き戻す**必要があるので、`EVP_MD_CTX_copy_ex` で
     コピーに対して試算し、一致したときだけ本体を更新する。
-- [x] **T.3.5** RELAY_EARLY(9): EXTEND2 は必ず RELAY_EARLY で送る。1 回路あたり最大 8 個。
-- [x] **T.3.6** DESTROY(4)受信で回路を閉じる。理由コードは tor-spec/tearing-down-circuits.md。
-- [x] **T.3.7** 完了条件: 1 ホップ回路で RELAY_BEGIN_DIR(13)→ CONNECTED(4)まで到達する
-      (次の M4 と合わせて検証してよい)。
+- [x] **T.1.4.5** RELAY_EARLY(9): EXTEND2 は必ず RELAY_EARLY で送る。1 回路あたり最大 8 個。
+- [x] **T.1.4.6** DESTROY(4)受信で回路を閉じる。理由コードは tor-spec/tearing-down-circuits.md。
+- [x] **T.1.4.7** 完了条件: 1 ホップ回路で RELAY_BEGIN_DIR(13)→ CONNECTED(4)まで到達する
+      (次の T.1.5 と合わせて検証してよい)。
 
-### M4. ディレクトリ取得と検証(`tor/dir/`)(T.4)
+### T.1.5 ディレクトリ取得と検証(`tor/dir/`)
 
-- [x] **T.4.1** 埋め込みデータ:
+- [x] **T.1.5.1** 埋め込みデータ:
   - 認証局: https://gitlab.torproject.org/tpo/core/tor/-/raw/main/src/app/config/auth_dirs.inc
     から `nickname, orport, v3ident, IPv4:dirport, RSA 識別子` を Rust の `const` 配列に写す
     (2026-09 時点で 9 局 + bridge 認証局 Serge。Serge は `bridge` なので除外)。
   - フォールバック: 同 `fallback_dirs.inc`(291 件)。`ip orport id` の 3 つだけ使う。
     先頭 30〜50 件で十分。**取得元 URL とコミットハッシュをソースのコメントに残す**。
-- [x] **T.4.2** BEGIN_DIR 経由 HTTP: 1 ホップ回路 → RELAY_BEGIN_DIR(payload 空) → CONNECTED →
+- [x] **T.1.5.2** BEGIN_DIR 経由 HTTP: 1 ホップ回路 → RELAY_BEGIN_DIR(payload 空) → CONNECTED →
       `GET <path> HTTP/1.0\r\nHost: <ip>\r\n\r\n` を RELAY_DATA(最大 498 バイト/セル)で送り、
       レスポンスを END まで読む。`.z` は付けない(圧縮なし。zlib を FFI する場合は後回し)。
   - `/tor/status-vote/current/consensus-microdesc`(約 2.5MB)
   - `/tor/keys/fp/<FP1>+<FP2>+...`(認証局の鍵証明書。`/tor/keys/all` でも可)
   - `/tor/micro/d/<D1>-<D2>-...`(base64、`=` なし、`+`ではなく`-`区切り、1 回 92 件まで)
-- [x] **T.4.3** 鍵証明書(dir-spec/creating-key-certificates.md): `dir-key-certificate-version 3`、`fingerprint`、
+- [x] **T.1.5.3** 鍵証明書(dir-spec/creating-key-certificates.md): `dir-key-certificate-version 3`、`fingerprint`、
       `dir-identity-key`、`dir-signing-key`、`dir-key-expires`、`dir-key-certification`。
       `fingerprint` が埋め込みの v3ident と一致し、`dir-key-certification` が
       identity key による SHA-1 署名(冒頭から `dir-key-certification\n` まで)として検証できること。
-- [x] **T.4.4** コンセンサス署名(dir-spec/consensus-formats.md): `directory-signature sha256 <identity> <signing-key-digest>`。
+- [x] **T.1.5.4** コンセンサス署名(dir-spec/consensus-formats.md): `directory-signature sha256 <identity> <signing-key-digest>`。
       ハッシュ対象は `network-status-version` の先頭から **`directory-signature ` の直後のスペースまで**
       (改行は含めない)。`sha256` 指定なら SHA-256、無指定なら SHA-1。
       **信頼する認証局の過半数**(9 局なら 5 以上)の有効な署名があれば受理する。
       `valid-until` を過ぎていれば再取得。
-- [x] **T.4.5** コンセンサスのパース(必要な行だけ): `r <nick> <id_b64> <date> <time> <ip> <orport> <dirport>`、
+- [x] **T.1.5.5** コンセンサスのパース(必要な行だけ): `r <nick> <id_b64> <date> <time> <ip> <orport> <dirport>`、
       `m <md_digest_b64>`、`s <flags>`、`w Bandwidth=<n>`、`p`(コンセンサス側の p は使わない)、
       `params`、`bandwidth-weights`、`valid-after/fresh-until/valid-until`。
       文字列は保持せず、`r` ごとに構造体(識別子 20B、md digest 32B、IPv4、port、flags bitset、bw u32)へ
       落として本文は捨てる(メモリ対策)。
-- [x] **T.4.6** microdesc(dir-spec/computing-microdescriptors.md): `onion-key`(無視可)、`ntor-onion-key <b64>`、
+- [x] **T.1.5.6** microdesc(dir-spec/computing-microdescriptors.md): `onion-key`(無視可)、`ntor-onion-key <b64>`、
       `id ed25519 <b64>`、`p accept|reject <ports>`、`family`。ダイジェストは
       **`onion-key` 行の先頭から末尾まで**の SHA-256(コンセンサスの `m` と照合)。
-- [x] **T.4.7** ディスクキャッシュ: `$TOR_STATE_DIR`(既定 `./state`)に `consensus`、`certs`、
+- [x] **T.1.5.7** ディスクキャッシュ: `$TOR_STATE_DIR`(既定 `./state`)に `consensus`、`certs`、
       `microdescs/<hex>`、`guard` を保存。起動時は有効期限内ならネットワークに行かない。
-- [x] **T.4.8** 完了条件: 署名検証済みのコンセンサスから、Guard/Exit の件数と `valid-until` をログ出力できる。
+- [x] **T.1.5.8** 完了条件: 署名検証済みのコンセンサスから、Guard/Exit の件数と `valid-until` をログ出力できる。
 
-### M5. 3 ホップ回路と経路選択(`path.rs`, `circuit.rs` の EXTEND2)(T.5)
+### T.1.6 3 ホップ回路と経路選択(`path.rs`, `circuit.rs` の EXTEND2)
 
-- [x] **T.5.1** EXTEND2(14)の payload: `NSPEC(1) | {LSTYPE(1) LSLEN(1) LSPEC}* | HTYPE(2)=2 | HLEN(2) | HDATA`。
+- [x] **T.1.6.1** EXTEND2(14)の payload: `NSPEC(1) | {LSTYPE(1) LSLEN(1) LSPEC}* | HTYPE(2)=2 | HLEN(2) | HDATA`。
       link specifier は **[00] IPv4(4+2)、[02] legacy id(20)、[03] Ed25519 id(32)** をこの順で。
       EXTENDED2(15)は CREATED2 と同じ `HLEN | HDATA`。
-- [x] **T.5.2** 経路選択(簡略版、path-spec 準拠は将来課題):
+- [x] **T.1.6.2** 経路選択(簡略版、path-spec 準拠は将来課題):
   - guard: flags に Guard, Running, Valid, Stable があるもの。1 台を選んで `state/guard` に永続化し、
     落ちるまで使い続ける(ガード固定は匿名性の基本)。
   - middle: Running, Valid。
@@ -317,47 +327,47 @@ src/
     初版では無視してよいが TODO コメントを残す)。
   - microdesc は **選んだ候補の分だけ**取得する(全 8000 件は取らない)。exit 候補は
     ポート別に 30 件程度をサンプリングして取得・キャッシュ。
-- [x] **T.5.3** 回路の再利用: 1 回路に複数ストリームを載せる。作成から 10 分または
+- [x] **T.1.6.3** 回路の再利用: 1 回路に複数ストリームを載せる。作成から 10 分または
       ストリームが失敗したら新しい回路を作る。回路作成の全体タイムアウトは 60 秒。
-- [x] **T.5.4** 完了条件: 3 ホップ回路で RELAY_BEGIN → CONNECTED が成功する。
+- [x] **T.1.6.4** 完了条件: 3 ホップ回路で RELAY_BEGIN → CONNECTED が成功する。
 
-### M6. ストリームとフロー制御(`stream.rs`)(T.6)
+### T.1.7 ストリームとフロー制御(`stream.rs`)
 
-- [x] **T.6.1** RELAY_BEGIN(1): `"host:port\0"`(FLAGS は省略)。CONNECTED(4)、END(3、理由コードは
+- [x] **T.1.7.1** RELAY_BEGIN(1): `"host:port\0"`(FLAGS は省略)。CONNECTED(4)、END(3、理由コードは
       tor-spec/closing-streams.md、空 payload は MISC 扱い)。
-- [x] **T.6.2** RELAY_DATA(2): 最大 498 バイト。
-- [x] **T.6.3** フロー制御(tor-spec/flow-control.md):
+- [x] **T.1.7.2** RELAY_DATA(2): 最大 498 バイト。
+- [x] **T.1.7.3** フロー制御(tor-spec/flow-control.md):
   - 回路レベル: deliver window 1000、100 受信ごとに SENDME(5, StreamID=0)。
     **version 1 形式**: `VERSION(1)=1 | DATA_LEN(2)=20 | DIGEST(20)`。DIGEST は
     「その SENDME を引き起こした(100 個目の)RELAY_DATA を処理した直後の Db running digest の値」。
     受信処理で 20 バイトのダイジェストを毎回控えておく。
   - ストリームレベル: window 500、50 受信ごとに SENDME(該当 StreamID)。
   - 送信側: package window(回路 1000、ストリーム 500)が 0 になったら相手の SENDME を待つ。
-- [x] **T.6.4** `TorStream`: `Read`/`Write` を実装し、`relay::bidirectional` にそのまま渡せるようにする。
-- [x] **T.6.5** 完了条件: 3 ホップ経由で `GET https://check.torproject.org/api/ip` の本文が取れ、
+- [x] **T.1.7.4** `TorStream`: `Read`/`Write` を実装し、`relay::bidirectional` にそのまま渡せるようにする。
+- [x] **T.1.7.5** 完了条件: 3 ホップ経由で `GET https://check.torproject.org/api/ip` の本文が取れ、
       100KB 超のダウンロード(SENDME が動く)が完走する。
 
-### M7. SOCKS5 サーバ(`socks5.rs`, `main.rs`)(T.7)
+### T.1.8 SOCKS5 サーバ(`socks5.rs`, `main.rs`)
 
-- [x] **T.7.1** greeting: `05 NMETHODS METHODS` → `05 00`(認証なし)。`00` が無ければ `05 FF` で切断。
-- [x] **T.7.2** request: `05 01 00 ATYP ...`。ATYP=03(hostname)を主に扱う。ATYP=01(IPv4)は許可、
+- [x] **T.1.8.1** greeting: `05 NMETHODS METHODS` → `05 00`(認証なし)。`00` が無ければ `05 FF` で切断。
+- [x] **T.1.8.2** request: `05 01 00 ATYP ...`。ATYP=03(hostname)を主に扱う。ATYP=01(IPv4)は許可、
       ATYP=04(IPv6)は `05 08`(address type not supported)。CMD≠01 は `05 07`。
-- [x] **T.7.3** 応答: 成功 `05 00 00 01 00000000 0000`、失敗は Tor の END 理由を SOCKS の REP に写像
+- [x] **T.1.8.3** 応答: 成功 `05 00 00 01 00000000 0000`、失敗は Tor の END 理由を SOCKS の REP に写像
       (EXITPOLICY→02 not allowed、RESOLVEFAILED→04 host unreachable、CONNECTREFUSED→05、他→01)。
-- [x] **T.7.4** 接続ごとにスレッド。`SERVER_PORT` 必須は既存 `config.rs` のまま。
-- [x] **T.7.5** 完了条件: `curl --socks5-hostname 127.0.0.1:$SERVER_PORT https://check.torproject.org/api/ip` が
+- [x] **T.1.8.4** 接続ごとにスレッド。`SERVER_PORT` 必須は既存 `config.rs` のまま。
+- [x] **T.1.8.5** 完了条件: `curl --socks5-hostname 127.0.0.1:$SERVER_PORT https://check.torproject.org/api/ip` が
       `"IsTor":true`。`ALL_PROXY=socks5h://...` でも同じ。
 
-### M8. 仕上げ(T.8)
+### T.1.9 仕上げ
 
-- [x] **T.8.1** ログ: `TOR_LOG=debug|info|warn` 環境変数で制御(println ベースで十分)。
-- [x] **T.8.2** 実行時 RSS の計測を README に記載(`/proc/<pid>/status` の VmHWM)。
-- [x] **T.8.3** `cargo clippy -- -D warnings`、`cargo fmt`。
-- [x] **T.8.4** README: 使い方、制限事項(匿名性は本家に劣る、onion 非対応)、必要ライブラリ。
+- [x] **T.1.9.1** ログ: `TOR_LOG=debug|info|warn` 環境変数で制御(println ベースで十分)。
+- [x] **T.1.9.2** 実行時 RSS の計測を README に記載(`/proc/<pid>/status` の VmHWM)。
+- [x] **T.1.9.3** `cargo clippy -- -D warnings`、`cargo fmt`。
+- [x] **T.1.9.4** README: 使い方、制限事項(匿名性は本家に劣る、onion 非対応)、必要ライブラリ。
 
 ---
 
-## 4. FFI 関数一覧(OpenSSL 3)
+### T.1 FFI 関数一覧(OpenSSL 3)
 
 `libssl`:
 `TLS_client_method`, `SSL_CTX_new`, `SSL_CTX_free`, `SSL_CTX_set_verify`, `SSL_new`, `SSL_free`,
@@ -385,7 +395,7 @@ src/
 
 ---
 
-## 5. 検証コマンド(各マイルストーンで実行)
+### T.1 検証コマンド(各子タスクの完了時に実行)
 
 ```sh
 # メモリ制限下でビルドが通ること(cgroup v2 + systemd ユーザセッションが必要)
@@ -409,9 +419,9 @@ curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
 
 ---
 
-## 5.5 実装状況(2026-09-02 完了)
+### T.1 実装状況(2026-09-02 完了)
 
-M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機テスト 4 件、
+T.1.1〜T.1.9 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機テスト 4 件、
 `cargo clippy --all-targets -- -D warnings` と `cargo fmt --check` がいずれも通る。
 `MemoryMax=200M` でのリリースビルド成功、実行時 VmHWM 18.4MB(目標 60MB 未満)。
 `curl --socks5-hostname` と `ALL_PROXY=socks5h://` の双方で `"IsTor":true`、
@@ -428,7 +438,7 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 2a. **OpenSSL はリンク時ではなく実行時に `dlopen` で読み込む**(2026-09-02 追加)。
    `#[link(name = "ssl")]` はリンカに `libssl.so` を探させるが、これは `-dev`
    パッケージだけが入れるバージョンなしのシンボリックリンクで、配備先のコンテナには
-   `libssl.so.3` しか無く `unable to find library -lssl` で失敗した。§0.3 の前提
+   `libssl.so.3` しか無く `unable to find library -lssl` で失敗した。T.1 の対象環境の前提
    (「`.so.3` があればよい」)を満たすため、全エントリポイントを `dlsym` で解決する
    方式に変更した。バイナリの `DT_NEEDED` から OpenSSL が消える。
    探索順は `TOR_LIBSSL`/`TOR_LIBCRYPTO` → `TOR_OPENSSL_DIR` → soname →
@@ -451,7 +461,7 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 
 ---
 
-## 6. 仕様の参照先
+### T.1 仕様の参照先
 
 ローカルに torspec をクローンして grep するのが速い:
 `git clone --depth 1 https://gitlab.torproject.org/tpo/core/torspec.git` → `spec/` 以下。
@@ -480,7 +490,7 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 
 ---
 
-## 7. 既知のリスクと対処
+### T.1 既知のリスクと対処
 
 - **ntor(v1)の廃止**: 現在は全リレーが受け付けるが、将来 ntor-v3 のみになる可能性がある。
   `ntor.rs` はハンドシェイクを trait 化して差し替えられるようにしておく。
@@ -495,27 +505,27 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 
 ---
 
-# 第 II 部 — Onion service(v3)クライアント 実装計画
+## T.2 Onion service(v3)クライアント
 
-第 I 部(M0〜M8)の上に、`.onion` v3 アドレスへ接続するクライアント機能を足す。
+T.1 の上に、`.onion` v3 アドレスへ接続するクライアント機能を足す。
 サービス側(自分が onion service を公開する)は対象外。仕様は
 `spec/rend-spec/` を正とし、本書には実装に必要なバイト列・鍵導出の要点と落とし穴だけを書く。
 
 ---
 
-## 8. 背景と決定事項
+### T.2 背景と決定事項
 
-### 8.1 現状の挙動
+#### 着手前の挙動
 
 `.onion` を SOCKS5 で受けると、通常のホスト名として 3 ホップ回路の出口に RELAY_BEGIN を
 送っている。出口は `.onion` を DNS 解決できないので END(RESOLVEFAILED)が返り、SOCKS には
 `04 host unreachable` が返る。バグではなく未実装。
 
-### 8.2 決定事項
+#### 決定事項
 
 1. **依存ゼロは維持する**。SHA3-256 / SHAKE-256 / AES-256-CTR は OpenSSL 3 に FFI を足す。
    **Ed25519 の点演算(鍵ブラインド)だけは OpenSSL が API を持たないので純 Rust で書く**
-   (§9 M9 参照。約 400 行、これが本計画で唯一の「暗号を自前実装する」箇所)。
+   (T.2.1 参照。約 400 行、これが T.2 で唯一の「暗号を自前実装する」箇所)。
 2. **対象は v3 のみ**(56 文字 + `.onion`)。v2(16 文字)は拒否して SOCKS `04` を返す。
 3. **クライアント認証(descriptor cookie / `intro-auth-required`)は非対応**。
    該当サービスには「認証が必要」とログを出して `02 not allowed` を返す。
@@ -525,17 +535,17 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
    メモリには `(RSA id 20B, Ed25519 id 32B)` の対だけ持つ(約 250KB)。
 5. **1 つの onion アドレスに対して rendezvous 回路は 1 本**を維持し、複数ストリームを載せる
    (C Tor と同じ)。回路の寿命・上限は既存の回路プールに相乗りする。
-6. **INTRODUCE1 に輻輳制御拡張は付けない**(第 I 部で cc を使わないのと整合)。
+6. **INTRODUCE1 に輻輳制御拡張は付けない**(T.1で cc を使わないのと整合)。
    `legacy-key`(TAP)を要求する intro point は無いものとして無視する。
 7. **descriptor は 3 ホップ回路の終端 HSDir から BEGIN_DIR で取る**(rend-spec の要求)。
    intro / rendezvous 回路も 3 ホップ。rendezvous 回路には 4 ホップ目として
    「仮想ホップ」(サービス)が乗る。
 
-### 8.3 用語(この部で使う記号)
+#### 用語(T.2 で使う記号)
 
 - `H(x)` = SHA3-256。`KDF(x, n)` = SHAKE-256 の先頭 n バイト。
 - `MAC(key, msg)` = `H(INT_8(len(key)) | key | msg)`。**`INT_8` は 8 バイト big-endian**
-  (第 I 部の `INT8` = 1 バイトとは別物。rend-spec の表記に合わせる)。
+  (T.1の `INT8` = 1 バイトとは別物。rend-spec の表記に合わせる)。
 - `A` = onion サービスの長期 Ed25519 公開鍵(アドレスに埋め込まれている)。
 - `A'` = 時刻周期ごとにブラインドした公開鍵。descriptor の署名鍵の親、HSDir の索引鍵。
 - `TP` = time period(既定 1440 分、12:00 UTC 切り替え)。`SRV` = shared random value。
@@ -543,7 +553,7 @@ M0〜M8 まで完了。`cargo test` 66 件、`cargo test -- --ignored` の実機
 
 ---
 
-## 9. アーキテクチャ(追加分)
+### T.2 アーキテクチャ(追加分)
 
 ```
 src/
@@ -573,26 +583,26 @@ src/
 
 ---
 
-## 10. マイルストーン
+### T.2 進め方
 
-各マイルストーンは第 I 部と同じく、完了条件を満たしたらコミットし、§5 のメモリ検証を通す。
+子タスク(T.2.1〜T.2.6)は T.1 と同じく、完了条件を満たしたらコミットし、T.1 の検証コマンドでメモリ検証を通す。
 `cargo clippy --all-targets -- -D warnings` と `cargo fmt --check` も維持する。
 
-### M9. 暗号プリミティブの追加(`ffi/hash.rs`, `ffi/aes.rs`, `crypto/`)(T.9)
+### T.2.1 暗号プリミティブの追加(`ffi/hash.rs`, `ffi/aes.rs`, `crypto/`)
 
-- [x] **T.9.1** FFI 追加: `EVP_sha3_256`, `EVP_shake256`, `EVP_DigestFinalXOF`, `EVP_aes_256_ctr`。
+- [x] **T.2.1.1** FFI 追加: `EVP_sha3_256`, `EVP_shake256`, `EVP_DigestFinalXOF`, `EVP_aes_256_ctr`。
       `ffi/mod.rs` のマクロに行を足すだけで呼び出しラッパが生える。
-- [x] **T.9.2** `hash::sha3_256(data) -> [u8; 32]`(one-shot、`EVP_Digest`)。
-- [x] **T.9.3** `hash::shake256(data, out_len) -> Vec<u8>`: `EVP_DigestInit_ex(ctx, EVP_shake256())` →
+- [x] **T.2.1.2** `hash::sha3_256(data) -> [u8; 32]`(one-shot、`EVP_Digest`)。
+- [x] **T.2.1.3** `hash::shake256(data, out_len) -> Vec<u8>`: `EVP_DigestInit_ex(ctx, EVP_shake256())` →
       `EVP_DigestUpdate` → `EVP_DigestFinalXOF(ctx, out, out_len)`。
       **`EVP_DigestFinalXOF` は 1 コンテキストにつき 1 回しか呼べない**ので、
       出力長を先に決めて一度で取り出す(必要な最大長は 128 バイト)。
-- [x] **T.9.4** `Digest` の汎用化: `Digest::sha1()` に加えて `Digest::sha3_256()`。`peek` の戻り値は
+- [x] **T.2.1.4** `Digest` の汎用化: `Digest::sha1()` に加えて `Digest::sha3_256()`。`peek` の戻り値は
       `[u8; 20]` 固定なので、`peek_into(&mut [u8])` か `peek_vec()` に変え、既存の
       `peek_prefix::<N>` はそのまま使えるようにする。`Clone`(`EVP_MD_CTX_copy_ex`)は
       SHA3 でも動く。
-- [x] **T.9.5** `Aes256Ctr`: `Aes128Ctr` と同じ実装で `EVP_aes_256_ctr` と鍵 32 バイト。
-- [x] **T.9.6** **純 Rust Ed25519 点演算**(`crypto/ed25519_point.rs`)。用途はブラインド `A' = h·A` のみ。
+- [x] **T.2.1.5** `Aes256Ctr`: `Aes128Ctr` と同じ実装で `EVP_aes_256_ctr` と鍵 32 バイト。
+- [x] **T.2.1.6** **純 Rust Ed25519 点演算**(`crypto/ed25519_point.rs`)。用途はブラインド `A' = h·A` のみ。
   - 体 `GF(2^255 - 19)`: 5 limb × 51 bit(`u64`、積は `u128`)。add / sub / mul / square /
     `invert`(フェルマー、`pow(p-2)`)/ `pow22523`(平方根用)。
   - 点は extended 座標 `(X, Y, Z, T)`。加算(`-x^2 + y^2 = 1 + d x^2 y^2`、`d = -121665/121666`)、
@@ -606,74 +616,74 @@ src/
     **`ED25519_BLINDING_PARAMS` は clamp 前の値**なので、`param[0] &= 248; param[31] &= 63;
     param[31] |= 64` してから掛ける(C Tor `ed25519_donna_blind_public_key` と同じ)。
     加えて RFC 8032 §7.1 の公開鍵 3 つで「伸長 → 圧縮」が恒等になることを確認する。
-- [x] **T.9.7** `crypto/base32.rs`: RFC 4648 アルファベット `a-z2-7`(小文字。大文字も受ける)、
+- [x] **T.2.1.7** `crypto/base32.rs`: RFC 4648 アルファベット `a-z2-7`(小文字。大文字も受ける)、
       パディング無し、56 文字 → 35 バイト。
-- [x] **T.9.8** 単体テスト: SHA3-256("abc") = `3a985da7…`、SHAKE-256("abc", 32) の既知値
+- [x] **T.2.1.8** 単体テスト: SHA3-256("abc") = `3a985da7…`、SHAKE-256("abc", 32) の既知値
       (`483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739`)、
       AES-256-CTR の NIST SP800-38A F.5.5、上記の ed25519 ブラインドベクタ、base32 の往復。
 - 完了条件: `cargo test` が通り、`MemoryMax=200M` でビルドが通る。
 
-### M10. アドレス・時刻周期・HSDir リング(`hs/address.rs`, `hs/blind.rs`, `hs/hsdir.rs`)(T.10)
+### T.2.2 アドレス・時刻周期・HSDir リング(`hs/address.rs`, `hs/blind.rs`, `hs/hsdir.rs`)
 
-- [x] **T.10.1** onion アドレス(rend-spec/encoding-onion-addresses.md):
+- [x] **T.2.2.1** onion アドレス(rend-spec/encoding-onion-addresses.md):
       `onion_address = base32(PUBKEY(32) | CHECKSUM(2) | VERSION(1)=0x03)`、
       `CHECKSUM = H(".onion checksum" | PUBKEY | VERSION)[0..2]`。
       末尾の `.onion` を(大文字小文字を無視して)剥がし、長さ 56 でなければ v2 か不正として拒否。
       チェックサムと VERSION を検証してから `A` を取り出す。
-- [x] **T.10.2** credential: `N_hs_cred = H("credential" | A)`、
+- [x] **T.2.2.2** credential: `N_hs_cred = H("credential" | A)`、
       `N_hs_subcred = H("subcredential" | N_hs_cred | A')`。`A'` は下で求める。
-- [x] **T.10.3** 時刻周期(rend-spec/shared-random-and-time-periods.md 相当):
+- [x] **T.2.2.3** 時刻周期(rend-spec/shared-random-and-time-periods.md 相当):
   - `period_length` = コンセンサス `params` の `hsdir-interval`(分、既定 1440)。
   - `period_num = floor((now_minutes - 12*60) / period_length)`。**`now` はコンセンサスの
     `valid-after` を使う**(C Tor の `hs_get_time_period_num(0)` と同じ。システム時計より HSDir と
     ずれにくい)。
   - テスト: `2016-04-13 11:59:59 UTC` → 16903、`2016-04-13 12:00:00 UTC` → 16904。
-- [x] **T.10.4** ブラインド係数(rend-spec/keyblinding.md 相当):
+- [x] **T.2.2.4** ブラインド係数(rend-spec/keyblinding.md 相当):
       `h = H(BLIND_STRING | A | s | B | N)` で
       `BLIND_STRING = "Derive temporary signing key" | 0x00`(**NUL 1 バイトを含む**)、
       `s` = 空(クライアント認証なし)、
       `B = "(15112221349535400772501151409588531511454012693041857206046113283949847762202, 46316835694926478169428394003475163141307993866256225615783033603165251855960)"`
       (**ベースポイントを 10 進の文字列として**そのまま入れる。括弧・カンマ・空白込み)、
       `N = "key-blind" | INT_8(period_num) | INT_8(period_length)`。
-      `h` を clamp(`h[0] &= 248; h[31] &= 63; h[31] |= 64`)して `A' = h·A`(M9 の点演算)。
-- [x] **T.10.5** コンセンサスのパース追加(`dir/consensus.rs`): `shared-rand-previous-value <reveals> <b64>`、
+      `h` を clamp(`h[0] &= 248; h[31] &= 63; h[31] |= 64`)して `A' = h·A`(T.2.1 の点演算)。
+- [x] **T.2.2.5** コンセンサスのパース追加(`dir/consensus.rs`): `shared-rand-previous-value <reveals> <b64>`、
       `shared-rand-current-value <reveals> <b64>`(各 32 バイト)、`params` から
       `hsdir-interval`、`hsdir_n_replicas`(既定 2)、`hsdir_spread_fetch`(既定 3)。
       `Consensus` 構造体にフィールドを足す。既存の「本文は保持しない」方針は維持。
-- [x] **T.10.6** SRV の選択: TP は 12:00 UTC に始まり、SRV は 00:00 UTC に更新される。
+- [x] **T.2.2.6** SRV の選択: TP は 12:00 UTC に始まり、SRV は 00:00 UTC に更新される。
       **その TP が始まった時点で current だった SRV** を使う。すなわち `valid-after` の時刻が
       `[12:00, 24:00)` なら `shared-rand-current-value`、`[00:00, 12:00)` なら
       `shared-rand-previous-value`。どちらも無い場合は
       `disaster_srv = H("shared-random-disaster" | INT_8(period_length) | INT_8(period_num))`。
-- [x] **T.10.7** HSDir 用 Ed25519 id 表(`client.rs`): `FLAG_HSDIR` を持つ全 `RouterStatus` の microdesc を
+- [x] **T.2.2.7** HSDir 用 Ed25519 id 表(`client.rs`): `FLAG_HSDIR` を持つ全 `RouterStatus` の microdesc を
       既存 `load_microdescs` 経由で取り、`HashMap<[u8;20], [u8;32]>`(RSA id → Ed25519 id)に
       落として `Mutex<Option<HsdirTable>>` に保持。コンセンサスが更新されたら作り直す。
       **`MAX_CACHED_MICRODESCS = 2000` を超える**ので、この用途では `Microdesc` を残さず
       id だけ抜いてすぐ捨てる(専用の `collect_ed_ids(digests)` を切る)。
       初回は 92 件 × 約 50 リクエストで 30〜60 秒かかる。`TOR_LOG=info` で進捗を出す。
       `id ed25519` の無い microdesc のリレーはリングから除外する。
-- [x] **T.10.8** リング計算(rend-spec/hsdir-ring.md 相当):
+- [x] **T.2.2.8** リング計算(rend-spec/hsdir-ring.md 相当):
       `hs_index(replica) = H("store-at-idx" | A' | INT_8(replica) | INT_8(period_length) | INT_8(period_num))`、
       `hsdir_index(node) = H("node-idx" | node_ed25519_id | SRV | INT_8(period_num) | INT_8(period_length))`。
       **2 つで `period_length` と `period_num` の順序が逆**。仕様どおりであってタイプミスではない。
       `replica` は **1 から** `hsdir_n_replicas` まで。全 HSDir を `hsdir_index` で昇順に並べ、
       各 replica について `hsdir_index >= hs_index(replica)` となる最初のノードから
       `hsdir_spread_fetch` 台を(末尾で先頭に巻き戻して)取り、重複を除く。通常 6 台。
-- [x] **T.10.9** 単体テスト: アドレスの往復とチェックサム不正の検出、時刻周期、SRV 選択の境界
+- [x] **T.2.2.9** 単体テスト: アドレスの往復とチェックサム不正の検出、時刻周期、SRV 選択の境界
       (11:59 / 12:00)、リングの巻き戻しと重複除去(ダミーの id で)。
 - 完了条件: `cargo test -- --ignored` のテストで実ネットワークのコンセンサスから、
-      既知の onion(下記 §12)に対する担当 HSDir 6 台の識別子と `A'` をログ出力できる。
+      既知の onion(T.2 の検証用 onion アドレス)に対する担当 HSDir 6 台の識別子と `A'` をログ出力できる。
 
-### M11. 終端指定の 3 ホップ回路と descriptor の取得・復号(`client.rs`, `hs/descriptor.rs`)(T.11)
+### T.2.3 終端指定の 3 ホップ回路と descriptor の取得・復号(`client.rs`, `hs/descriptor.rs`)
 
-- [x] **T.11.1** `TorClient::build_circuit_to(last: &RelayInfo) -> io::Result<Circuit>`: guard(固定)→
+- [x] **T.2.3.1** `TorClient::build_circuit_to(last: &RelayInfo) -> io::Result<Circuit>`: guard(固定)→
       middle(既存の選び方、`last` と同一 /16・family を避ける)→ `last` へ EXTEND2。
       既存の `build_circuit(port)` はこれを使って exit を選ぶ形に寄せる(exit 選択だけが差)。
       HSDir / IP / RP の 3 用途で共有する。
-- [x] **T.11.2** 取得: `RelayInfo` を `RouterStatus` + microdesc から作り(既存 `relay_info`)、
+- [x] **T.2.3.2** 取得: `RelayInfo` を `RouterStatus` + microdesc から作り(既存 `relay_info`)、
       `build_circuit_to` → `begin_dir_stream` → 既存 `fetch::get(circuit, "/tor/hs/3/<A' の base64(パディング無し、43 文字)>")`。
       404 は「その HSDir に無い」なので次の HSDir へ。6 台をランダム順に最大 3 台まで試す。
-- [x] **T.11.3** 外層のパース(rend-spec/hs-desc-encoding.md 相当):
+- [x] **T.2.3.3** 外層のパース(rend-spec/hs-desc-encoding.md 相当):
       `hs-descriptor 3`、`descriptor-lifetime <分>`、`descriptor-signing-key-cert`(ED25519 CERT
       オブジェクト、既存 `certs.rs` でパース)、`revision-counter <n>`、`superencrypted`
       (MESSAGE オブジェクト)、`signature <b64>`。
@@ -682,7 +692,7 @@ src/
   - 署名: 署名対象は `"Tor onion service descriptor sig v3"` | 文書先頭から `signature `
     (末尾のスペースを含む)まで。`KP_hs_desc_sign` で検証。
   - `descriptor-lifetime` と証明書期限を過ぎたものは捨てる。
-- [x] **T.11.4** 2 段復号(`superencrypted` → 中層 → `encrypted` → 内層)。両段とも同じ構造:
+- [x] **T.2.3.4** 2 段復号(`superencrypted` → 中層 → `encrypted` → 内層)。両段とも同じ構造:
   - blob = `SALT(16) | ENCRYPTED | MAC(32)`。
   - `secret_input = SECRET_DATA | N_hs_subcred | INT_8(revision_counter)`、
     `keys = KDF(secret_input | SALT | STRING_CONSTANT, 32+16+32)` →
@@ -693,9 +703,9 @@ src/
     内段: `SECRET_DATA = A'`(クライアント認証なし)、`STRING_CONSTANT = "hsdir-encrypted-data"`。
   - 復号結果の末尾は NUL でパディングされている(10KB 単位)。**末尾の NUL を剥がしてから**
     テキストとして扱う。
-- [x] **T.11.5** 中層は読み飛ばしてよい(`desc-auth-type x25519`、`desc-auth-ephemeral-key`、`auth-client` × N
+- [x] **T.2.3.5** 中層は読み飛ばしてよい(`desc-auth-type x25519`、`desc-auth-ephemeral-key`、`auth-client` × N
       はクライアント認証なしでもダミーが入っている)。`encrypted` の MESSAGE を取って内段へ。
-- [x] **T.11.6** 内層のパース: `create2-formats 2`(2 を含まなければ拒否)、`intro-auth-required`(あれば
+- [x] **T.2.3.6** 内層のパース: `create2-formats 2`(2 を含まなければ拒否)、`intro-auth-required`(あれば
       非対応として拒否)、`single-onion-service`(無視)、`flow-control`(無視)。
       以下を `introduction-point` ごとに 1 組:
   - `introduction-point <b64>`: 中身は EXTEND2 と同じ `NSPEC | {LSTYPE LSLEN LSPEC}*`。
@@ -709,34 +719,38 @@ src/
     落ちない。TODO コメントを残す)。
   - `legacy-key` / `legacy-key-cert` は読み飛ばす。
   - 上の 4 要素から `IntroPoint { relay: RelayInfo, auth_key: [u8;32], enc_key: [u8;32] }` を作る。
-- [x] **T.11.7** descriptor キャッシュ: `HashMap<onion_address, (Descriptor, fetched_at, period_num)>`。
+- [x] **T.2.3.7** descriptor キャッシュ: `HashMap<onion_address, (Descriptor, fetched_at, period_num)>`。
       `descriptor-lifetime`(既定 180 分)か TP の切り替えで失効。ディスクには置かない。
-- [x] **T.11.8** 単体テスト: 復号は「自分で暗号化した blob を復号する」往復テストで十分
-      (鍵導出と MAC の式が仕様と一致していることは M11 の完了条件で実機確認する)。
+- [x] **T.2.3.8** 単体テスト: 復号は「自分で暗号化した blob を復号する」往復テストで十分
+      (鍵導出と MAC の式が仕様と一致していることは T.2.3 の完了条件で実機確認する)。
       内層パースは固定の文字列で。
-- 完了条件: `cargo test -- --ignored` で既知の onion(§12)の descriptor を取得・復号し、
+- [ ] **T.2.3.9** `enc-key-cert` の subject が `enc-key` を Ed25519 に変換した鍵と一致するかを検証する
+      (proposal 228 appendix A)。T.2.3.6 で任意として省き、`src/tor/hs/descriptor.rs` に TODO を
+      残したもの。C Tor も検証しておらず、変換で符号ビットを 0 にするため subject は検証に
+      使えない形でもある。実装するか、やらないと決めてこのタスクを閉じるかを判断する。
+- 完了条件: `cargo test -- --ignored` で既知の onion(T.2 の検証用 onion アドレス)の descriptor を取得・復号し、
       intro point の台数と `AUTH_KEY` をログ出力できる。
 
-### M12. 回路の一般化と hs-ntor(`circuit.rs`, `hs/ntor.rs`)(T.12)
+### T.2.4 回路の一般化と hs-ntor(`circuit.rs`, `hs/ntor.rs`)
 
-- [x] **T.12.1** `Hop` の暗号方式を hop ごとに選べるようにする: `enum HopCipher { Aes128(Aes128Ctr), Aes256(Aes256Ctr) }`
+- [x] **T.2.4.1** `Hop` の暗号方式を hop ごとに選べるようにする: `enum HopCipher { Aes128(Aes128Ctr), Aes256(Aes256Ctr) }`
       と `Digest`(md 選択済み)。既存 3 ホップは SHA-1/AES-128、仮想ホップは
       **SHA3-256 / AES-256-CTR**。`build_relay_cell` / `decrypt_inbound` は `peek_prefix::<4>` を
       使っているのでそのまま動く。**SENDME v1 が引用する digest は SHA3 でも先頭 20 バイト**
       (`last_recv_digest: [u8; 20]` は変えなくてよい)。
-- [x] **T.12.2** `Circuit::add_virtual_hop(keys: HsCircuitKeys)`: `hops` に SHA3/AES-256 の Hop を push する。
+- [x] **T.2.4.2** `Circuit::add_virtual_hop(keys: HsCircuitKeys)`: `hops` に SHA3/AES-256 の Hop を push する。
       以降 `open_stream` は最後の hop(= サービス)を宛先にするので変更不要。
-- [x] **T.12.3** 制御セルの mailbox: `State.handshake: Option<Result<Vec<u8>,String>>` を
+- [x] **T.2.4.3** 制御セルの mailbox: `State.handshake: Option<Result<Vec<u8>,String>>` を
       `control: VecDeque<(u8 /*relay cmd*/, Vec<u8>)>` に一般化し、
       `RELAY_EXTENDED2` と同様に **`RENDEZVOUS_ESTABLISHED(39)`、`INTRODUCE_ACK(40)`、
       `RENDEZVOUS2(37)`** を `handle_relay` で積んで `event.notify_all()`。
       `wait_for_control(cmd, timeout) -> io::Result<Vec<u8>>` を `wait_for_handshake` と同じ形で書く。
-- [x] **T.12.4** `Circuit::send_control(relay_cmd, payload)`: StreamID 0、最後の hop 宛て、RELAY_EARLY なし。
-- [x] **T.12.5** 定数追加: `RELAY_ESTABLISH_RENDEZVOUS = 33`、`RELAY_INTRODUCE1 = 34`、`RELAY_RENDEZVOUS2 = 37`、
+- [x] **T.2.4.4** `Circuit::send_control(relay_cmd, payload)`: StreamID 0、最後の hop 宛て、RELAY_EARLY なし。
+- [x] **T.2.4.5** 定数追加: `RELAY_ESTABLISH_RENDEZVOUS = 33`、`RELAY_INTRODUCE1 = 34`、`RELAY_RENDEZVOUS2 = 37`、
       `RELAY_RENDEZVOUS_ESTABLISHED = 39`、`RELAY_INTRODUCE_ACK = 40`。
-- [x] **T.12.6** `begin_stream` の onion 版: payload は **`":<port>\0"`(ホスト名は空)**。C Tor は
+- [x] **T.2.4.6** `begin_stream` の onion 版: payload は **`":<port>\0"`(ホスト名は空)**。C Tor は
       rendezvous 回路では address を送らない。`begin_stream_onion(port)` を足す。
-- [x] **T.12.7** hs-ntor(rend-spec/introduction-protocol.md「ntor-with-extra-data」):
+- [x] **T.2.4.7** hs-ntor(rend-spec/introduction-protocol.md「ntor-with-extra-data」):
   - `PROTOID = "tor-hs-ntor-curve25519-sha3-256-1"`、`t_hsenc = PROTOID | ":hs_key_extract"`、
     `t_hsverify = PROTOID | ":hs_verify"`、`t_hsmac = PROTOID | ":hs_mac"`、
     `m_hsexpand = PROTOID | ":hs_key_expand"`。
@@ -754,19 +768,19 @@ src/
     **`MAC(key, msg)` の第 1 引数が key**(`H(INT_8(len) | key | msg)`)。C Tor の
     `crypto_mac_sha3_256(out, key, msg)` の引数順と同じ。
   - `NtorClient` と同様に `HsNtorClient::new(auth_key, enc_key)` / `introduce1_keys()` /
-    `finish(reply) -> HsCircuitKeys` の形にする。第 I 部 §7 の「ハンドシェイクは差し替え可能に」
+    `finish(reply) -> HsCircuitKeys` の形にする。T.1 の既知のリスクにある「ハンドシェイクは差し替え可能に」
     という方針に合わせ、`CircuitKeys` とは別型にする(鍵長が違う)。
-- [x] **T.12.8** 単体テスト: 仮想ホップ付き 4 ホップの `state_with_hops` で既存の「onion 層が目的の hop で
+- [x] **T.2.4.8** 単体テスト: 仮想ホップ付き 4 ホップの `state_with_hops` で既存の「onion 層が目的の hop で
       剥がれる」テストを SHA3/AES-256 の hop に対しても回す。hs-ntor は C Tor
       `src/test/test_hs_ntor.c` の往復(サーバ側も同じ式で書けるので、テスト内にサーバ側を実装して
       往復させる)。
 - 完了条件: `cargo test` が通り、既存の実機テスト 4 件が退行していない。
 
-### M13. Rendezvous と Introduce(`hs/rendezvous.rs`, `client.rs`)(T.13)
+### T.2.5 Rendezvous と Introduce(`hs/rendezvous.rs`, `client.rs`)
 
-- [x] **T.13.1** RP の選択: `Running, Valid, Stable, Fast` を持つリレーから帯域重みで 1 台
+- [x] **T.2.5.1** RP の選択: `Running, Valid, Stable, Fast` を持つリレーから帯域重みで 1 台
       (guard と同一 /16・family を避ける。exit フラグは不要)。microdesc を取って `RelayInfo` にする。
-- [x] **T.13.2** 手順(rend-spec/rendezvous-protocol.md, introduction-protocol.md):
+- [x] **T.2.5.2** 手順(rend-spec/rendezvous-protocol.md, introduction-protocol.md):
   1. `build_circuit_to(RP)`。`cookie = RAND(20)`。`send_control(ESTABLISH_RENDEZVOUS, cookie)`。
      `wait_for_control(RENDEZVOUS_ESTABLISHED, 30s)`(本体は空)。
   2. descriptor の intro point をランダム順に 1 つ選び `build_circuit_to(IP.relay)`。
@@ -797,37 +811,37 @@ src/
   5. RP 回路で `wait_for_control(RENDEZVOUS2, 60s)` → `HANDSHAKE_INFO = Y(32) | AUTH(32)`。
      `HsNtorClient::finish` で鍵を得て `add_virtual_hop`。
   6. `begin_stream_onion(port)` で CONNECTED まで待つ。以降は通常の `TorStream`。
-- [x] **T.13.3** 再試行: intro point は最大 3 つ試す。INTRODUCE_ACK が 1(未知の鍵)なら descriptor
+- [x] **T.2.5.3** 再試行: intro point は最大 3 つ試す。INTRODUCE_ACK が 1(未知の鍵)なら descriptor
       キャッシュを捨てて 1 回だけ取り直す。RP 回路の失敗は RP を選び直す。
       全体の上限は 90 秒(既存の回路作成 60 秒とは別枠)。
-- [x] **T.13.4** `TorClient::connect_onion(address: &OnionAddress, port) -> io::Result<TorStream>`:
+- [x] **T.2.5.4** `TorClient::connect_onion(address: &OnionAddress, port) -> io::Result<TorStream>`:
       `Mutex<HashMap<onion_address, Circuit>>` で rendezvous 回路を再利用し、閉じていたら作り直す。
       `MAX_CIRCUITS` の数え上げに含める。`MAX_CIRCUIT_AGE` も同じ値でよい。
-- [x] **T.13.5** 失敗の分類(SOCKS 写像用): descriptor が 6 台とも無い → `NotFound`、
+- [x] **T.2.5.5** 失敗の分類(SOCKS 写像用): descriptor が 6 台とも無い → `NotFound`、
       `intro-auth-required` → `PermissionDenied`、intro/rendezvous のタイムアウト → `TimedOut`、
       その他 → `Other`。既存 `reply_code` の `io::ErrorKind` 分岐に乗る。
-- 完了条件: `cargo test -- --ignored` で既知の onion(§12)に HTTP GET し、200 が返る。
+- 完了条件: `cargo test -- --ignored` で既知の onion(T.2 の検証用 onion アドレス)に HTTP GET し、200 が返る。
 
-### M14. SOCKS5 統合と仕上げ(`socks5.rs`, `main.rs`, README)(T.14)
+### T.2.6 SOCKS5 統合と仕上げ(`socks5.rs`, `main.rs`, README)
 
-- [x] **T.14.1** `socks5.rs`: `ATYP_DOMAIN` で受けたホスト名が(大文字小文字を無視して)`.onion` で終わるなら
+- [x] **T.2.6.1** `socks5.rs`: `ATYP_DOMAIN` で受けたホスト名が(大文字小文字を無視して)`.onion` で終わるなら
       `OnionAddress::parse` に通し、成功なら `connect_onion`、v2 や不正なら `04 host unreachable`
       を返してログに理由を出す。それ以外は従来どおり `connect`。
       `ATYP_IPV4` に `.onion` は来ないので考慮不要。
-- [x] **T.14.2** ログ: descriptor 取得先 HSDir、選んだ IP と RP、各段の所要時間を `TOR_LOG=debug` で出す。
+- [x] **T.2.6.2** ログ: descriptor 取得先 HSDir、選んだ IP と RP、各段の所要時間を `TOR_LOG=debug` で出す。
       **onion アドレスそのものは `info` では出さない**(ログから訪問先が分かる)。`debug` のみ。
-- [x] **T.14.3** 計測を README に追記: 初回の HSDir 表構築の所要時間、`.onion` 初回接続の所要時間、
+- [x] **T.2.6.3** 計測を README に追記: 初回の HSDir 表構築の所要時間、`.onion` 初回接続の所要時間、
       2 回目(回路再利用)の所要時間、接続後の `VmHWM`(目標: 従来 + 数 MB 以内)。
-- [x] **T.14.4** README の Limitations を更新: 「onion services」を「Not implemented」から外し、
+- [x] **T.2.6.4** README の Limitations を更新: 「onion services」を「Not implemented」から外し、
       「クライアント認証と v2 は非対応、サービス側は非対応」に書き換える。
-      `TASKS.md` の §0.2 の記述も同期する。
-- [x] **T.14.5** `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、§5 のメモリ検証。
-- 完了条件: `curl --socks5-hostname 127.0.0.1:$SERVER_PORT http://<§12 の onion>/` が本文を返す。
+      `TASKS.md` の T.1 の決定事項も同期する。
+- [x] **T.2.6.5** `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、T.1 の検証コマンドでのメモリ検証。
+- 完了条件: `curl --socks5-hostname 127.0.0.1:$SERVER_PORT http://<T.2 の検証用 onion>/` が本文を返す。
       同時に `https://check.torproject.org/api/ip` が従来どおり `"IsTor":true`。
 
 ---
 
-## 11. FFI 関数一覧(追加分)
+### T.2 FFI 関数一覧(追加分)
 
 `libcrypto`: `EVP_sha3_256`, `EVP_shake256`, `EVP_DigestFinalXOF`, `EVP_aes_256_ctr`
 
@@ -836,7 +850,7 @@ src/
 
 ---
 
-## 12. 検証用の onion アドレス
+### T.2 検証用の onion アドレス
 
 実機テスト(`#[ignore]`)と完了条件には、運用が安定している公開サービスを使う。
 死んでいたら差し替える(`curl --socks5-hostname` を本家 tor で試して生存確認してから使う):
@@ -849,7 +863,7 @@ src/
 
 ---
 
-## 13. 仕様の参照先(追加分)
+### T.2 仕様の参照先(追加分)
 
 | トピック | ファイル(spec/ 配下) |
 |---|---|
@@ -874,7 +888,7 @@ Rust では arti の `tor-hscrypto`(ブラインドと時刻周期)、`tor-hscli
 
 ---
 
-## 14. 既知のリスクと対処(追加分)
+### T.2 既知のリスクと対処(追加分)
 
 - **Ed25519 点演算の自前実装**: バグがあると `A'` が違う HSDir を指すだけで、暗号的な
   安全性の問題にはならない(秘密を扱わない)。C Tor のテストベクタで固定し、さらに
@@ -896,9 +910,9 @@ Rust では arti の `tor-hscrypto`(ブラインドと時刻周期)、`tor-hscli
 
 ---
 
-## 15. 実装状況(第 II 部、2026-09-02 完了)
+### T.2 実装状況(2026-09-02 完了)
 
-M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実機テスト 7 件、
+T.2.1〜T.2.6 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実機テスト 7 件、
 `cargo clippy --all-targets -- -D warnings` と `cargo fmt --check` がいずれも通る。
 `MemoryMax=200M` でのリリースビルド成功。
 
@@ -917,7 +931,7 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
 
 計画から意図的に外した点、および計画になかった追加は次のとおり。
 
-1. **descriptor の署名対象は `signature ` を含まない**(§10 M11 の記述と異なる)。
+1. **descriptor の署名対象は `signature ` を含まない**(T.2.3 の記述と異なる)。
    コンセンサスは `directory-signature ` のキーワードまでを署名対象に含むが、
    descriptor は `signature ` 行の**直前の改行まで**である。C Tor の
    `desc_sig_is_valid` が `"\nsignature "` を探して `sig_start++` するのが根拠で、
@@ -938,23 +952,23 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
    ディスクキャッシュは 4MB から 25MB に増える。
 7. **`hsdir-interval` の既定値は `dir/consensus.rs` の `Params::default` に置いた**。
    コンセンサスパラメータの既定値が 1 か所にまとまる。
-8. **SOCKS5 のテストにあった既存の flake を直した**(第 II 部とは無関係)。
+8. **SOCKS5 のテストにあった既存の flake を直した**(T.2とは無関係)。
    拒否した要求の残りバイトを読まずにソケットを閉じると FIN ではなく RST が飛び、
    直前に書いた応答がクライアントに届く前に捨てられていた。4 回に 1 回失敗していた。
 
 ---
 
-# 第 III 部 — 速くて手軽な常駐プロキシ 実装計画
+## T.3 速くて手軽な常駐プロキシ
 
-第 I・II 部の上に、**待ち時間とスループット**を本家並みに近づけ、**何も設定せずに動かし続けられる**
-ようにする。方針は「速くて手軽」。匿名性の強化(vanguards、ストリーム分離など)は本計画の
+T.1・T.2 の上に、**待ち時間とスループット**を本家並みに近づけ、**何も設定せずに動かし続けられる**
+ようにする。方針は「速くて手軽」。匿名性の強化(vanguards、ストリーム分離など)は T.3 の
 対象外とし、現状の匿名性を大きく下げない範囲で速度を取る。
 
 ---
 
-## 16. 背景と決定事項
+### T.3 背景と決定事項
 
-### 16.1 何が遅いか(2026-09-02 時点の実測と内訳)
+#### 何が遅いか(2026-09-02 時点の実測と内訳)
 
 | 項目 | 実測 | 内訳 |
 |---|---|---|
@@ -966,9 +980,9 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
 | スループット | 410KB/s | window 方式の上限 = 1000 セル × 498B ≈ 500KB / RTT。RTT 1 秒強の回路でちょうどこの値 |
 
 要するに、(1) 起動時に大きな文書を非圧縮で取る、(2) 何もかも要求が来てから直列に作る、
-(3) フロー制御が window/RTT で頭打ち、の 3 つ。第 III 部はこの順に潰す。
+(3) フロー制御が window/RTT で頭打ち、の 3 つ。T.3 はこの順に潰す。
 
-また、常駐させると次の問題が出る(第 I・II 部の範囲外だったもの):
+また、常駐させると次の問題が出る(T.1・T.2 の範囲外だったもの):
 
 - コンセンサスを起動時に 1 度しか取らない(`client.rs` の `Directory` は不変)。`valid-until`
   (3 時間)を過ぎると古いリレー表で走り続け、翌日 12:00 UTC の time period 切替後は古い `A'`
@@ -977,7 +991,7 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
 - ガードへの接続に 1 度失敗しただけで別のガードに乗り換え、失敗リストはプロセスが生きている間
   戻らない。ネットワークが一瞬切れるとガードが替わる(ガード固定の目的を損なう)。
 
-### 16.2 決定事項
+#### 決定事項
 
 1. **Listen は `0.0.0.0` のまま。接続数・帯域の上限、SOCKS 認証は付けない**。SOCKS5 の
    user/pass(method 0x02)は「受理して読み捨てる」だけにし、資格情報によるストリーム分離も
@@ -999,19 +1013,19 @@ M9〜M14 まで完了。`cargo test` 129 件、`cargo test -- --ignored` の実�
 6. **スレッドモデルは変えない**(`std::thread` + ブロッキング I/O)。バックグラウンドは
    「保守スレッド 1 本」と「回路ビルダースレッド 1 本」、それに `.onion` 確立とディレクトリ
    並列取得の短命スレッドだけ。
-7. **マイルストーンの順序は価値順**。M15(常駐)と M16(待ち時間)だけでも十分に価値があり、
-   M18〜M19(ntor-v3 と cc)は最後。
+7. **子タスクの順序は価値順**。T.3.1(常駐)と T.3.2(待ち時間)だけでも十分に価値があり、
+   T.3.4〜T.3.5(ntor-v3 と cc)は最後。
 
-### 16.3 対象外
+#### 対象外
 
 bridge と PT、conflux、CGO(2026 年時点で実験段階、既定無効)、onion service の PoW(解なしでも
 「努力ゼロ」の INTRODUCE1 として扱われるだけで拒否はされない)、リンク v5 とパディング交渉、
 vanguards-lite、IPv6 宛先、SOCKS の RESOLVE、onion service のサービス側とクライアント認証。
-匿名性の強化は第 IV 部があればそこで扱う。
+匿名性の強化は、やるなら別のタスクを立てて扱う。
 
 ---
 
-## 17. アーキテクチャ(追加分)
+### T.3 アーキテクチャ(追加分)
 
 ```
 src/
@@ -1041,16 +1055,16 @@ RP 用 1 本(短命)、ディレクトリ並列取得の最大 4 本(短命)。
 
 ---
 
-## 18. マイルストーン
+### T.3 進め方
 
-第 I・II 部と同じく、完了条件を満たしたらコミットし、§5 のメモリ検証、
+子タスク(T.3.1〜T.3.6)は T.1・T.2 と同じく、完了条件を満たしたらコミットし、T.1 の検証コマンドでメモリ検証、
 `cargo clippy --all-targets -- -D warnings`、`cargo fmt --check` を通す。
 速度の完了条件は同じ回路でも揺れるので、**5 回計測の中央値**で判定する。
-M15 に着手する前に §20 の「現状」列の未計測項目を埋めておく(比較の基準になる)。
+T.3.1 に着手する前に T.3 の計測表の「現状」列の未計測項目を埋めておく(比較の基準になる)。
 
-### M15. 常駐化: コンセンサス更新、圧縮と diff、キャッシュ剪定、ガードの再試行(T.15)
+### T.3.1 常駐化: コンセンサス更新、圧縮と diff、キャッシュ剪定、ガードの再試行
 
-- [x] **T.15.1** **zlib FFI(`ffi/zlib.rs`)**: `libz.so.1` を `ffi/mod.rs` と同じ dlopen 方式で読む。
+- [x] **T.3.1.1** **zlib FFI(`ffi/zlib.rs`)**: `libz.so.1` を `ffi/mod.rs` と同じ dlopen 方式で読む。
       関数は `zlibVersion`、`inflateInit2_`、`inflate`、`inflateEnd` の 4 つ。
   - `z_stream` は呼び出し側が確保する構造体なので **Rust 側に `#[repr(C)]` で同じレイアウトを書く**:
     `next_in: *const u8, avail_in: c_uint, total_in: c_ulong, next_out: *mut u8, avail_out: c_uint,
@@ -1063,15 +1077,15 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - `inflate_all(data, max_out) -> io::Result<Vec<u8>>`。出力は `MAX_RESPONSE_BYTES` で打ち切る
     (圧縮爆弾対策)。
   - 読めなかった場合は `None` を返し、呼び出し側は非圧縮で要求する。起動時に 1 行ログ。
-- [x] **T.15.2** **ディレクトリ要求の圧縮(`fetch.rs`)**: zlib が使えるとき URL に `.z` を付ける
+- [x] **T.3.1.2** **ディレクトリ要求の圧縮(`fetch.rs`)**: zlib が使えるとき URL に `.z` を付ける
       (dir-spec: `.z` = zlib 圧縮、応答は `Content-Encoding: deflate`)。応答ヘッダの
       `Content-Encoding` が `deflate` なら inflate、`identity` または無しならそのまま。
       コンセンサス、鍵証明書、microdesc、onion descriptor のすべてに適用する。
-- [x] **T.15.3** **ディレクトリ要求の並列化(`fetch.rs`, `dir/mod.rs`)**: `stream_microdescs` の
+- [x] **T.3.1.3** **ディレクトリ要求の並列化(`fetch.rs`, `dir/mod.rs`)**: `stream_microdescs` の
       バッチを 1 本の 1 ホップ回路の上で **BEGIN_DIR ストリーム 4 本**に分けて同時に取る
       (`Circuit` は複数ストリームを扱えるので、スレッド 4 本で `fetch::get` を呼ぶだけ)。
       主な対象は HSDir リング構築の 31 バッチ。
-- [x] **T.15.4** **consensus diff(`dir/diff.rs`)**: 手元のコンセンサス本文の SHA3-256 を
+- [x] **T.3.1.4** **consensus diff(`dir/diff.rs`)**: 手元のコンセンサス本文の SHA3-256 を
       `X-Or-Diff-From-Consensus: <hex>` ヘッダで送る。応答が `network-status-diff-version 1` で
       始まれば diff、`network-status-version` で始まれば全文。
   - 2 行目 `hash <from> <to>`: `from` が手元の SHA3-256 と一致しなければ捨てて全文取得。
@@ -1083,7 +1097,7 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - 手元の本文は `state/consensus` から読む(メモリには本文を持たない方針のまま)。
     適用中だけ旧本文 + 新本文の約 7MB を持つ。
   - 単体テスト: 小さな文書に対する d / a / c と降順適用、`hash` 不一致の拒否。
-- [x] **T.15.5** **保守スレッド(`tor/maintain.rs`)**: bootstrap 後に 1 本起動し、次を回す。
+- [x] **T.3.1.5** **保守スレッド(`tor/maintain.rs`)**: bootstrap 後に 1 本起動し、次を回す。
   1. **コンセンサス更新**: `fresh-until` から `(valid-until − fresh-until) × 3/4` の区間に
      一様乱数で時刻を決めて取得する(正確な式は dir-spec/client-operation.md を正とする)。
      経路は既存 `dir_circuit()`(ガードへの 1 ホップ)。失敗は 5 分後から倍々で最大 30 分まで
@@ -1095,12 +1109,12 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
      メモリキャッシュは digest 単位で有効なので残す、回路プールもそのまま。
   3. **キャッシュ剪定**: 差し替え直後に `state/microdescs/` を走査し、新コンセンサスの `m`
      行に無い digest のファイルを削除する。`*.tmp` も消す。
-  4. **HSDir リングの先読み**: 差し替え後(および起動直後、M16 の stub 作成の後)に
+  4. **HSDir リングの先読み**: 差し替え後(および起動直後、T.3.2 の stub 作成の後)に
      `hsdir_ring()` をバックグラウンドで呼ぶ。2 回目以降は差分の microdesc だけなので数秒。
   5. **ガードの再試行**(下記)。
   `Directory` の読み手(`client.rs` の `router()` など)は `RwLock` の read ガードを短く取る
   (回路構築の間じゅう握らない)。
-- [x] **T.15.6** **ガードの再試行(`client.rs`)**: 失敗しても即座に忘れない。
+- [x] **T.3.1.6** **ガードの再試行(`client.rs`)**: 失敗しても即座に忘れない。
   - `state/guard` を `state/guards` にし、最大 3 台を優先順で保存する(先頭が primary)。
   - ガードへの接続失敗時: フォールバック 2 台に TCP 接続できるか調べ、どちらも駄目なら
     「こちらが断」と判断してガードは変えず失敗を返す(保守スレッドが 30 秒後に再接続する)。
@@ -1108,16 +1122,16 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - 保守スレッドは `failed_at` から 10 分ごとに primary へ再接続を試み、成功したら以降の
     新規回路は primary に戻す(既存回路はそのまま)。
   - 新しいコンセンサスに primary が無ければ次点へ。Running が無いだけなら試し続ける。
-- [x] **T.15.7** **bootstrap の短縮**: `state/guards` があるときは、フォールバックではなく **ガードに
+- [x] **T.3.1.7** **bootstrap の短縮**: `state/guards` があるときは、フォールバックではなく **ガードに
       直接つないでコンセンサスを取る**(TLS が 1 本減る)。コンセンサスは `.z` + diff。
-- [x] **T.15.8** 単体テスト: diff 適用、剪定(ダミーのファイル)、更新時刻の乱数が区間内、ガードの状態遷移。
+- [x] **T.3.1.8** 単体テスト: diff 適用、剪定(ダミーのファイル)、更新時刻の乱数が区間内、ガードの状態遷移。
 - 完了条件: 冷えた状態の bootstrap が **10 秒以内**(現状 13〜27 秒)。`TOR_LOG=info` で
   4 時間以上動かし、コンセンサスが diff で更新された行と剪定の行がログに出る。
   翌日(12:00 UTC 以降)も再起動なしで `.onion` に接続できる。`state/` の容量が増え続けない。
 
-### M16. 待ち時間ゼロ化: 事前構築、並列化、楽観応答(T.16)
+### T.3.2 待ち時間ゼロ化: 事前構築、並列化、楽観応答
 
-- [x] **T.16.1** **回路プールとビルダースレッド(`tor/pool.rs`)**: 現在 `client.rs` にある
+- [x] **T.3.2.1** **回路プールとビルダースレッド(`tor/pool.rs`)**: 現在 `client.rs` にある
       `circuits` / `onion_circuits` の管理をここへ移す。
   - **stub**: guard → middle の 2 ホップ回路。常に 2 本用意する。要求が来たら stub を取り、
     最後の 1 ホップ(exit / HSDir / IP / RP)だけ EXTEND2 する。middle が最後のホップと同一の
@@ -1128,11 +1142,11 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - **dirty 回路**: 使用中。dirtiness は **初回使用から** 10 分(現状は構築時から)。
   - ビルダーは `Condvar` で起こす(プールが減ったとき、コンセンサス差し替え、30 秒周期)。
     合計は `MAX_CIRCUITS`(8)のまま。stub を作れない(ガード断)ときは指数バックオフ。
-- [x] **T.16.2** **ストリームの分散**: 新しいストリームは「ポートを許す回路のうち開いているストリームが
+- [x] **T.3.2.2** **ストリームの分散**: 新しいストリームは「ポートを許す回路のうち開いているストリームが
       最少のもの」に載せる。最少が 4 以上で上限未満なら stub から新しい回路を作り、以後の
       ストリームをそちらへ。window 方式では回路ごとに 1000 セル / RTT の上限があるので、
       並列ダウンロードの合計が回路数に比例して伸びる。
-- [x] **T.16.3** **楽観応答(optimistic data)**(`circuit.rs`, `socks5.rs`): コンセンサスは
+- [x] **T.3.2.3** **楽観応答(optimistic data)**(`circuit.rs`, `socks5.rs`): コンセンサスは
       `UseOptimisticData=1`。tor-spec/opening-streams.md のとおり、CONNECTED を待たずに
       RELAY_DATA を送ってよい。
   - `Circuit::begin_stream` を「BEGIN を送ったら即 `TorStream` を返す」に変え、
@@ -1148,22 +1162,22 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   - 失敗が SOCKS の応答コードでなく切断で見えるようになるので、END の理由を `info` で出す。
   - rendezvous 回路でも同じにする。サービス側が CONNECTED 前の DATA を受けなかった場合は
     実機で分かるので、そのときは onion だけ CONNECTED 待ちに戻す。
-- [x] **T.16.4** **TCP_NODELAY**: ガードチャネルの `TcpStream` と SOCKS クライアントの `TcpStream` に
+- [x] **T.3.2.4** **TCP_NODELAY**: ガードチャネルの `TcpStream` と SOCKS クライアントの `TcpStream` に
       `set_nodelay(true)`。セル 1 個(514 バイト)の書き込みが Nagle で遅延しないようにする。
-- [x] **T.16.5** **`.onion` の並列化(`rendezvous.rs`, `client.rs`)**:
+- [x] **T.3.2.5** **`.onion` の並列化(`rendezvous.rs`, `client.rs`)**:
   - RP 回路(stub から 1 ホップ + ESTABLISH_RENDEZVOUS)を別スレッドで作りながら、
     呼び出し元スレッドで IP 回路(stub から 1 ホップ)を作る。INTRODUCE1 は
     **RENDEZVOUS_ESTABLISHED を受けてから**送る(先に送るとサービスが RP に来たとき cookie が
     無く、RENDEZVOUS1 が捨てられる)。
   - descriptor は担当 HSDir 2 台に同時に要求し、先に返った方を採る(stub 2 本消費)。
     もう一方の回路は閉じる。
-  - リングは M15 で先読み済みなので、冷えた状態でも待つのは descriptor + RP / IP の分だけ。
-- [x] **T.16.6** **bandwidth-weights(`consensus.rs`, `path.rs`)**: `bandwidth-weights` 行を
+  - リングは T.3.1 で先読み済みなので、冷えた状態でも待つのは descriptor + RP / IP の分だけ。
+- [x] **T.3.2.6** **bandwidth-weights(`consensus.rs`, `path.rs`)**: `bandwidth-weights` 行を
       `Params` と同様に読み、guard / middle / exit の位置ごとに `Wgg Wgm Wgd Wmg Wmm Wme Wmd
       Wee Wem Wed`(単位 1/10000)を掛けて `weighted_choice` する。速度には中立だが
       `path.rs` の TODO を解消し、本家と同じ分布になる。dir-spec/consensus-formats.md の
       bandwidth-weights と path-spec の重み付けの節を正とする。
-- [x] **T.16.7** 単体テスト: プールの状態遷移(stub 消費と補充、predicted ports の更新)、
+- [x] **T.3.2.7** 単体テスト: プールの状態遷移(stub 消費と補充、predicted ports の更新)、
       楽観送信の再送バッファ(CONNECTED 前 END → 再送、上限超過 → 閉じる)、
       ストリーム分散の選択規則、bandwidth-weights の適用。
 - 完了条件(5 回の中央値): ready 後の初回 `curl https://check.torproject.org/api/ip` の
@@ -1172,79 +1186,79 @@ M15 に着手する前に §20 の「現状」列の未計測項目を埋めて�
   **8 秒以内**、2 回目は現状どおり 1 秒台。4 並列の 2MB ダウンロードの合計スループットが
   単一の **3 倍以上**。
 
-### M17. SOCKS の手軽さ: SOCKS4a、HTTP CONNECT、既定ポート(T.17)
+### T.3.3 SOCKS の手軽さ: SOCKS4a、HTTP CONNECT、既定ポート
 
-- [x] **T.17.1** **先頭 1 バイトで振り分け(`socks5.rs`)**: `0x05` → SOCKS5(既存)、`0x04` → SOCKS4 / 4a、
+- [x] **T.3.3.1** **先頭 1 バイトで振り分け(`socks5.rs`)**: `0x05` → SOCKS5(既存)、`0x04` → SOCKS4 / 4a、
       ASCII 大文字(`A`〜`Z`)→ HTTP。それ以外は切断。
-- [x] **T.17.2** **SOCKS4a**: `VN=4 | CD=1 | DSTPORT(2) | DSTIP(4) | USERID… NUL`、DSTIP が `0.0.0.x`
+- [x] **T.3.3.2** **SOCKS4a**: `VN=4 | CD=1 | DSTPORT(2) | DSTIP(4) | USERID… NUL`、DSTIP が `0.0.0.x`
       (x ≠ 0)なら続けて `HOST… NUL`(4a)。応答 `VN=0 | CD=90(許可)/ 91(拒否) | DSTPORT(2) | DSTIP(4)`。
       `.onion` も同じ経路。proxychains の既定設定(`socks4 127.0.0.1 9050`)がそのまま通る。
-- [x] **T.17.3** **HTTP CONNECT**: `CONNECT host:port HTTP/1.x` の 1 行と空行までのヘッダを読み、
+- [x] **T.3.3.3** **HTTP CONNECT**: `CONNECT host:port HTTP/1.x` の 1 行と空行までのヘッダを読み、
       `HTTP/1.1 200 Connection established\r\n\r\n` を返して以後トンネル。CONNECT 以外の
       メソッド(絶対 URI の GET など、`http_proxy` で平文 HTTP を通そうとした場合)は
       `HTTP/1.1 501` と「use socks5h://」の本文で断る。`https_proxy=http://127.0.0.1:9050`
       の curl が通る。
-- [x] **T.17.4** **SOCKS5 の method 0x02**: `0x00` が無く `0x02` だけを申し出るクライアントも受理し、
+- [x] **T.3.3.4** **SOCKS5 の method 0x02**: `0x00` が無く `0x02` だけを申し出るクライアントも受理し、
       RFC 1929 の `01 ULEN UNAME PLEN PASSWD` を読み捨てて `01 00` を返す。資格情報は使わない。
-- [x] **T.17.5** **`SERVER_PORT` の既定を 9050 に**(`config.rs`)。未設定でも動く。
-- [x] **T.17.6** 楽観応答(M16)を 3 つの入口すべてに適用する。
-- [x] **T.17.7** 単体テスト: 振り分け、SOCKS4a の解析と応答、CONNECT の解析と 501、method 0x02 の読み捨て。
+- [x] **T.3.3.5** **`SERVER_PORT` の既定を 9050 に**(`config.rs`)。未設定でも動く。
+- [x] **T.3.3.6** 楽観応答(T.3.2)を 3 つの入口すべてに適用する。
+- [x] **T.3.3.7** 単体テスト: 振り分け、SOCKS4a の解析と応答、CONNECT の解析と 501、method 0x02 の読み捨て。
 - 完了条件: `proxychains -q curl https://check.torproject.org/api/ip`(既定 conf)、
   `https_proxy=http://127.0.0.1:9050 curl …`、`curl --socks5-hostname …` の 3 つで `"IsTor":true`。
 
-### M18. ntor-v3(`tor/ntor_v3.rs`, `circuit.rs`)(T.18)
+### T.3.4 ntor-v3(`tor/ntor_v3.rs`, `circuit.rs`)
 
 輻輳制御の前提。この段階では拡張フィールドを空にして送り、フロー制御は window 方式のまま。
 tor-spec/create-created-cells.md の ntor-v3 節(proposal 332)を正とする。
 
-- [x] **T.18.1** CREATE2 / EXTEND2 の `HTYPE = 0x0003`。`ID` は **リレーの Ed25519 識別子**(microdesc の
+- [x] **T.3.4.1** CREATE2 / EXTEND2 の `HTYPE = 0x0003`。`ID` は **リレーの Ed25519 識別子**(microdesc の
       `id ed25519`。無いリレーには従来の ntor を使う)、`B` は `ntor-onion-key`。
-- [x] **T.18.2** 記法: `ENCAP(s) = INT_8(len(s)) | s`(8 バイト big-endian、`hs::int8` と同じ)、
+- [x] **T.3.4.2** 記法: `ENCAP(s) = INT_8(len(s)) | s`(8 バイト big-endian、`hs::int8` と同じ)、
       `H(s, t) = SHA3_256(ENCAP(t) | s)`、`MAC(k, msg, t) = SHA3_256(ENCAP(t) | ENCAP(k) | msg)`、
       `KDF(s, t) = SHAKE_256(ENCAP(t) | s)`、`ENC(k, m) = AES_256_CTR(k, m)`(IV 0)。
       `PROTOID = "ntor3-curve25519-sha3_256-1"`。tweak は `PROTOID | ":kdf_phase1"`、
       `":msg_mac"`、`":key_seed"`、`":verify"`、`":kdf_final"`、`":auth_final"`。
       検証文字列 `VER = "circuit create"`(arti の `NTOR3_CIRC_VERIFICATION`)。
-- [x] **T.18.3** クライアント側(送信):
+- [x] **T.3.4.3** クライアント側(送信):
   - `x, X` を生成、`Bx = EXP(B, x)`。
   - `phase1 = KDF(Bx | ID | X | B | PROTOID | ENCAP(VER), t_msgkdf)` → `ENC_K1(32) | MAC_K1(32)`。
   - `CM`(クライアントメッセージ)= 拡張フィールド列 `N_EXT(1) | {TYPE(1) LEN(1) BODY}*`。
-    M18 では `N_EXT = 0`。
+    T.3.4 では `N_EXT = 0`。
   - `encrypted = ENC(ENC_K1, CM)`、`mac = MAC(MAC_K1, ID | B | X | encrypted, t_msgmac)`。
   - HDATA = `ID(32) | B(32) | X(32) | encrypted | mac(32)`。
-- [x] **T.18.4** クライアント側(受信 `Y(32) | AUTH(32) | encrypted_reply`):
+- [x] **T.3.4.4** クライアント側(受信 `Y(32) | AUTH(32) | encrypted_reply`):
   - `secret_input = EXP(Y, x) | Bx | ID | B | X | Y | PROTOID | ENCAP(VER)`。
   - `ntor_key_seed = H(secret_input, t_key_seed)`、`verify = H(secret_input, t_verify)`。
   - `KDF(ntor_key_seed, t_final)` の先頭から `ENC_KEY(32)` を取り、残りが回路鍵の
     キーストリーム(`Df(20) | Db(20) | Kf(16) | Kb(16)`。tor1 のリレー暗号は従来どおり)。
   - `auth_input = verify | ID | B | Y | X | mac | ENCAP(encrypted_reply) | PROTOID | "Server"`、
     `AUTH == H(auth_input, t_auth)` を定数時間比較。
-  - `SM = DEC(ENC_KEY, encrypted_reply)` を拡張フィールドとして解析する(M19 で使う)。
+  - `SM = DEC(ENC_KEY, encrypted_reply)` を拡張フィールドとして解析する(T.3.5 で使う)。
   - **連結順は上の記述より仕様と C Tor `src/core/crypto/onion_ntor_v3.c` を優先**し、
     テストベクタで固定する。
-- [x] **T.18.5** `NtorClient` と同じ形の `NtorV3Client::new(id, b) / onion_skin(exts) / finish(reply) -> (CircuitKeys, Vec<Ext>)`。
+- [x] **T.3.4.5** `NtorClient` と同じ形の `NtorV3Client::new(id, b) / onion_skin(exts) / finish(reply) -> (CircuitKeys, Vec<Ext>)`。
       `Circuit::create` / `extend` は `RelayInfo.ed_identity` があれば ntor-v3、無ければ ntor。
       ディレクトリ用の 1 ホップは CREATE_FAST のまま。
-- [x] **T.18.6** 単体テスト: C Tor `src/test/` の ntor-v3 テスト(`test_ntor_v3.c` 相当。`grep -rl ntor3 src/test/`)
+- [x] **T.3.4.6** 単体テスト: C Tor `src/test/` の ntor-v3 テスト(`test_ntor_v3.c` 相当。`grep -rl ntor3 src/test/`)
       と arti `tor-proto` の `ntor_v3.rs` にある固定ベクタ(鍵と乱数を固定した往復)。無ければ
-      第 II 部の hs-ntor と同様に、テスト内にサーバ側を書いて往復させる。
+      T.2の hs-ntor と同様に、テスト内にサーバ側を書いて往復させる。
 - 完了条件: 3 ホップすべて ntor-v3 で `https://check.torproject.org/api/ip` が `"IsTor":true`。
   既存の実機テスト 7 件が退行しない。
 
-### M19. 輻輳制御(`tor/cc.rs`, `circuit.rs`, `hs/`)(T.19)
+### T.3.5 輻輳制御(`tor/cc.rs`, `circuit.rs`, `hs/`)
 
 proposal 324(`324-rtt-congestion-control.txt`)と param-spec.md の `cc_*` を正とする。
 C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
 
-- [x] **T.19.1** **交渉**: 終端ホップ(exit、または onion service)との ntor-v3 に拡張 `TYPE=01`
+- [x] **T.3.5.1** **交渉**: 終端ホップ(exit、または onion service)との ntor-v3 に拡張 `TYPE=01`
       (cc 要求、本体なし)を入れる。応答の `TYPE=02` の本体 `sendme_inc(1)` を採用する
       (現在 31)。応答が無ければその回路は window 方式。**中間ホップとは交渉しない**。
-- [x] **T.19.2** **回路ごとのフロー制御を `enum FlowControl { Window(既存), Congestion(cc::State) }`** にし、
+- [x] **T.3.5.2** **回路ごとのフロー制御を `enum FlowControl { Window(既存), Congestion(cc::State) }`** にし、
       受信・送信処理を分岐する。
-- [x] **T.19.3** **受信側**: `sendme_inc` セルごとに SENDME(version 1、digest 付き。形式は既存)を送る。
+- [x] **T.3.5.3** **受信側**: `sendme_inc` セルごとに SENDME(version 1、digest 付き。形式は既存)を送る。
       100 個ごとの回路 window と 50 個ごとのストリーム window は使わない。
       **周期がずれると相手が回路を切る**ので、カウントは既存の受信ダイジェスト処理と同じ場所で行う。
-- [x] **T.19.4** **送信側**: `inflight = sent − acked`。SENDME 1 個 = `sendme_inc` セルの ACK。
+- [x] **T.3.5.4** **送信側**: `inflight = sent − acked`。SENDME 1 個 = `sendme_inc` セルの ACK。
       `inflight < cwnd` のときだけ送る(既存の package window 待ちと同じ Condvar)。
   - RTT: 送信セルの通し番号が `sendme_inc` の倍数になるたびに `Instant` を控え、対応する
     SENDME が来たら差を取る。`min_rtt` と EWMA(`cc_ewma_cwnd_pct`、上限 `cc_ewma_max`)を持つ。
@@ -1260,64 +1274,64 @@ C Tor では `src/core/or/congestion_control_{common,vegas,flow}.c`。
     `congestion_control_vegas.c` に合わせる**。
   - パラメータは exit 回路には `*_exit`、onion 回路には `*_onion` を使う。既定値は
     param-spec.md、コンセンサス `params` にあればそれを使う(`Params` に追加)。
-- [x] **T.19.5** **ストリームのフロー制御 XON/XOFF**: `RELAY_XOFF = 43`(本体 `version(1)=0`)、
+- [x] **T.3.5.5** **ストリームのフロー制御 XON/XOFF**: `RELAY_XOFF = 43`(本体 `version(1)=0`)、
       `RELAY_XON = 44`(本体 `version(1)=0 | kbps_ewma(4)`)。
   - 受信: 相手からの XOFF でそのストリームの送信を止め、XON で再開する(`TorStream::write` の待ち)。
   - 送信: ストリームの未読バッファが `cc_xoff_client` セル分を超えたら XOFF、
     半分以下に減ったら XON(`kbps_ewma` は 0 = 制限なしでよい)。既存の
     「アプリが読み切ってから SENDME」の仕組みを XON/XOFF に置き換える。
-- [x] **T.19.6** **onion service**: descriptor 内層の `flow-control <range> <sendme_inc>` 行を読む
+- [x] **T.3.5.6** **onion service**: descriptor 内層の `flow-control <range> <sendme_inc>` 行を読む
       (`descriptor.rs`)。range が `2` を含むなら INTRODUCE1 の暗号化部の拡張に `TYPE=01`
       (cc 要求)を入れ、仮想ホップを `Congestion` にする(`sendme_inc` は descriptor の値)。
       無ければ window。
-- [x] **T.19.7** 単体テスト: cc の状態機械を「相手役」を書いて回す(SENDME の周期、cwnd の増減、
+- [x] **T.3.5.7** 単体テスト: cc の状態機械を「相手役」を書いて回す(SENDME の周期、cwnd の増減、
       XOFF で止まり XON で再開、`inflight` の上限)。RTT は `Instant` を注入できる形にして
       決定的にする。
 - 完了条件: 単一ストリームの 10MB ダウンロード(5 回の中央値)が window 方式の **2 倍以上**。
   `.onion` の 10MB も同様に速くなる。既存の実機テストが退行しない。
   cc の回路で 1 時間の連続ダウンロードが `DESTROY` なしに完走する(周期ずれの検出)。
 
-### M20. 仕上げ(T.20)
+### T.3.6 仕上げ
 
-- [x] **T.20.1** README: 計測表を更新する(§20 の項目)。Limitations に「複数回路に分散するので出口が増える」
+- [x] **T.3.6.1** README: 計測表を更新する(T.3 の計測の項目)。Limitations に「複数回路に分散するので出口が増える」
       「楽観応答により失敗が SOCKS コードでなく切断で見える」を追記。「Not implemented」から
       「congestion control」「consensus diffs or compression」を外す。SOCKS4a と HTTP CONNECT の
       使い方、`SERVER_PORT` の既定を追記。
-- [x] **T.20.2** `TASKS.md` §0.2 の決定事項 4 と §1 の非ゴールを第 III 部の結果に同期する。
-      末尾に「§23 実装状況(第 III 部)」を第 I・II 部と同じ形式で書く。
-- [x] **T.20.3** `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、§5 のメモリ検証。
+- [x] **T.3.6.2** `TASKS.md` の T.1 の決定事項 4 とゴールと非ゴールを T.3 の結果に同期する。
+      T.3 の実装状況を T.1・T.2 と同じ形式で書く。
+- [x] **T.3.6.3** `cargo clippy --all-targets -- -D warnings`、`cargo fmt`、T.1 の検証コマンドでのメモリ検証。
       実行時 VmHWM は **35MB 未満**を維持する(現状 26.5MB + 常駐回路 3 本 + zlib)。
 - 完了条件: README の表がすべて実測で埋まっている。
 
 ---
 
-## 19. FFI 関数一覧(追加分)
+### T.3 FFI 関数一覧(追加分)
 
 `libz.so.1`(dlopen、無くても動く): `zlibVersion`, `inflateInit2_`, `inflate`, `inflateEnd`。
 定数: `Z_OK=0`, `Z_STREAM_END=1`, `Z_NEED_DICT=2`, `Z_DATA_ERROR=-3`, `Z_MEM_ERROR=-4`,
 `Z_BUF_ERROR=-5`, `Z_VERSION_ERROR=-6`, `Z_NO_FLUSH=0`, `windowBits=47`。
 
-OpenSSL の追加はなし(SHA3-256、SHAKE-256、AES-256-CTR、X25519 は第 II 部までで揃っている)。
+OpenSSL の追加はなし(SHA3-256、SHAKE-256、AES-256-CTR、X25519 はT.2までで揃っている)。
 
 ---
 
-## 20. 計測(README に載せる項目)
+### T.3 計測(README に載せる項目)
 
 すべて 5 回の中央値。`curl -w '%{time_appconnect} %{time_starttransfer} %{speed_download}\n'` を使う。
 
-| 項目 | 現状(第 II 部完了時) | 目標 |
+| 項目 | 現状(T.2 完了時) | 目標 |
 |---|---|---|
-| 冷えた bootstrap → listening | 13〜27 秒 | 10 秒以内(M15) |
+| 冷えた bootstrap → listening | 13〜27 秒 | 10 秒以内(T.3.1) |
 | 温かい bootstrap(live consensus あり) | ほぼ 0 | 変わらず |
-| ready 後の初回接続: 先頭バイトまで | 未計測(数秒) | 2 秒以内(M16) |
-| 2 本目以降: TLS 確立まで | 未計測 | 現状より約 1 往復短い(M16) |
-| `.onion` 初回(冷 / 温) | 51 秒 / 13 秒 | 20 秒 / 8 秒(M16) |
+| ready 後の初回接続: 先頭バイトまで | 未計測(数秒) | 2 秒以内(T.3.2) |
+| 2 本目以降: TLS 確立まで | 未計測 | 現状より約 1 往復短い(T.3.2) |
+| `.onion` 初回(冷 / 温) | 51 秒 / 13 秒 | 20 秒 / 8 秒(T.3.2) |
 | `.onion` 2 回目 | 1.2 秒 | 1 秒台 |
-| 単一ストリーム 10MB | 410KB/s 相当 | 2 倍以上(M19) |
-| 4 並列 2MB の合計 | 未計測 | 単一の 3 倍以上(M16) |
-| 4 時間連続稼働後のコンセンサス更新 | 無し | diff で更新される(M15) |
+| 単一ストリーム 10MB | 410KB/s 相当 | 2 倍以上(T.3.5) |
+| 4 並列 2MB の合計 | 未計測 | 単一の 3 倍以上(T.3.2) |
+| 4 時間連続稼働後のコンセンサス更新 | 無し | diff で更新される(T.3.1) |
 | VmHWM | 26.5MB | 35MB 未満 |
-| `state/` の容量 | 増え続ける | コンセンサス 1 本ぶんで安定(M15) |
+| `state/` の容量 | 増え続ける | コンセンサス 1 本ぶんで安定(T.3.1) |
 
 ```sh
 SERVER_PORT=9050 TOR_LOG=info ./target/release/rust-tor-proxy &
@@ -1336,7 +1350,7 @@ grep -E 'VmHWM' /proc/$!/status; du -sh state
 
 ---
 
-## 21. 仕様の参照先(追加分)
+### T.3 仕様の参照先(追加分)
 
 | トピック | 場所 |
 |---|---|
@@ -1358,7 +1372,7 @@ grep -E 'VmHWM' /proc/$!/status; du -sh state
 
 ---
 
-## 22. 既知のリスクと対処(追加分)
+### T.3 既知のリスクと対処(追加分)
 
 - **楽観応答で失敗が見えにくい**: 出口が拒否したときクライアントには切断として見える。
   END の理由を `info` でログに出し、再送バッファで `EXITPOLICY` は別回路にやり直す。
@@ -1366,7 +1380,7 @@ grep -E 'VmHWM' /proc/$!/status; du -sh state
   分散のしきい値(4 ストリーム)は定数にする。
 - **zlib の `z_stream` レイアウト**: 合わないと `Z_VERSION_ERROR` か即クラッシュ。
   起動時に `zlibVersion()` をログに出し、`inflateInit2_` の戻り値を必ず検査する。
-  aarch64 / x86_64 の LP64 のみ対象(第 I 部と同じ)。
+  aarch64 / x86_64 の LP64 のみ対象(T.1と同じ)。
 - **diff の適用ミス**: 結果の SHA3-256 と署名検証の二重チェックで検出し、全文取得に戻す。
 - **ガードの再試行と乗り換えの境界**: 「こちらが断」の判定をフォールバックへの TCP 接続で
   行うので、フォールバック側が落ちていると誤判定してガードを替えてしまう。2 台に当たる。
@@ -1376,21 +1390,21 @@ grep -E 'VmHWM' /proc/$!/status; du -sh state
   範囲外は既定に戻す(`Params::parse` の方針と同じ)。
 - **ntor-v3 の連結順**: 本書の式は要旨。テストベクタが通るまで実機にはつながない。
 - **サービス側が楽観送信に非対応の可能性**: rendezvous 回路で CONNECTED 前の DATA が
-  捨てられるなら、onion だけ CONNECTED 待ちに戻す(M16 の完了条件で確認)。
+  捨てられるなら、onion だけ CONNECTED 待ちに戻す(T.3.2 の完了条件で確認)。
 - **メモリ**: 常駐回路 3 本と zlib、diff 適用中の本文 2 つぶんで数 MB 増える。
-  目標 35MB 未満、上限 60MB は第 I 部のまま。
+  目標 35MB 未満、上限 60MB はT.1のまま。
 
 ---
 
-## 23. 実装状況(第 III 部、2026-09-03 完了)
+### T.3 実装状況(2026-09-03 完了)
 
-M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実機テスト 8 件、
+T.3.1〜T.3.6 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実機テスト 8 件、
 `cargo clippy --all-targets -- -D warnings` と `cargo fmt --check` がいずれも通る。
 `MemoryMax=200M` でのリリースビルドは 26 秒で成功、バイナリ 1.4MB。
 
-§20 の計測表に対する結果(すべて aarch64 / OpenSSL 3.6.4 / 実ネットワーク):
+T.3 の計測表に対する結果(すべて aarch64 / OpenSSL 3.6.4 / 実ネットワーク):
 
-| 項目 | 現状(第 II 部) | 目標 | 実測 |
+| 項目 | 現状(T.2) | 目標 | 実測 |
 |---|---|---|---|
 | 冷えた bootstrap → listening | 13〜27 秒 | 10 秒以内 | **7〜9 秒** |
 | 温かい bootstrap | ほぼ 0 | 変わらず | 1.4 秒 |
@@ -1424,19 +1438,19 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
    「クライアントは `.z` URL を要求すべきでない」「匿名要求では deflate 以外を
    広告すべきでない」と書いている。1 本の値で両方を満たせるので、TASKS の
    `.z` 案ではなくヘッダ方式にした。
-3. **`X-Or-Diff-From-Consensus` のダイジェストは署名部のみ**。TASKS §M15 は
+3. **`X-Or-Diff-From-Consensus` のダイジェストは署名部のみ**。T.3.1 の記述は
    「手元のコンセンサス本文の SHA3-256」と書いていたが、dir-spec は
    「`directory-signature<SPACE>` までの署名部」と定める。全文のダイジェストを
    送るとサーバは diff を返さない。また、手元が最新のときサーバは **304** を返す。
    これを失敗として扱うと 3.6MB を無駄に取り直すので、結果として扱う。
-4. **リレーセルの送信順序が壊れていた**(第 I・II 部から潜在)。セルをロック内で
+4. **リレーセルの送信順序が壊れていた**(T.1・T.2 から潜在)。セルをロック内で
    組み立ててロック解放後に送っていたため、並行 writer で順序が入れ替わると
    ダイジェスト鎖が合わなくなり、中継が `DESTROY(PROTOCOL)` を返す。
-   第 III 部で入れたディレクトリの並列取得とストリーム分散が、この潜在バグを
+   T.3で入れたディレクトリの並列取得とストリーム分散が、この潜在バグを
    踏むようにした。送信順序専用のロックを導入し、writer も pump も同じ順序
    (send_order → state)で取るようにした。writer は窓待ちを先に済ませてから
    取るので、待っている間に順序ロックを握り続けることはない。
-5. **`RESOLVEFAILED` も別回路で再試行する**。TASKS §M16 は「宛先の問題なので
+5. **`RESOLVEFAILED` も別回路で再試行する**。T.3.2 の記述は「宛先の問題なので
    再試行しない」としていたが、resolver の壊れた出口は実際に存在し(最初の
    スループット計測で 1 本引いた)、それは宛先ではなく出口の問題である。
    C Tor も再試行する。`CONNECTREFUSED` だけはそのまま返す。
@@ -1460,12 +1474,12 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 
 ---
 
-## 24. 速い経路の自動選択(2026-09-03、調査と実装)
+## T.4 速い経路の自動選択(2026-09-03、調査と実装)
 
 「自動で速い経路を選べるか」という問いに対する調査と、その結果入れた機能。
 計画にあった作業ではないので、経緯と根拠をここに残す。
 
-### 24.1 まず計測した
+### T.4 まず計測した
 
 実ネットワークで、回路を変えながら 8MB を落として調べた。
 
@@ -1482,10 +1496,10 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 - **ガードの寄与が大きい**。連続 4 回で 402/203/667/194 のガードと
   771/1367/1123/1032 のガードがあった(約 4 倍)。
 - **同じ回路の 2 回目は 1 回目より速い**。9/9 で、中央値 452 → 757 KB/s(1.67 倍)。
-  輻輳窓の立ち上がりであり、短い転送の計測を支配する。§23 の「4 並列で 4.4 倍」も
+  輻輳窓の立ち上がりであり、短い転送の計測を支配する。T.3 の実装状況にある「4 並列で 4.4 倍」も
   2MB 転送でこれを踏んでいる。
 
-### 24.2 したがって「最適化」ではなく「外れ値の排除」にした
+### T.4 「最適化」ではなく「外れ値の排除」にした理由
 
 13 エージェントによる調査(仕様・C Tor/arti・本コード・攻撃面)の最重要の指摘は、
 **計測値が敵の操作できる入力である**こと。特に「遅いから引き直す」は、敵対中継が
@@ -1496,7 +1510,7 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 順位づけは敵に「わずかに速く見せる」勾配を与えるが、下限は「使い物にならない」以外の
 利得を与えない。残ったものからは**ランダム**に選ぶ。
 
-### 24.3 入れたもの
+### T.4 入れたもの
 
 | 場所 | 内容 |
 |---|---|
@@ -1513,7 +1527,7 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 `Unresponsive` は回路自体が死んでいるので閉じ、無限のハングをクライアントに
 見えるエラーに変える。
 
-### 24.4 レビューで潰した欠陥(6 観点 × 敵対検証、confirmed 33 件)
+### T.4 レビューで潰した欠陥(6 観点 × 敵対検証、confirmed 33 件)
 
 最初の実装には実バグがあり、多エージェントレビューで検出して直した。
 
@@ -1529,7 +1543,7 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 | 降格が 10 分後の `retry_primary_guard` で復活し、上限だけ消費される | `demoted_at` を追加。降格は 30 分持続し、接続失敗の再試行とは別物として扱う |
 | 到達不能条件 `len() < 2 && len() >= MAX_GUARDS` (常に偽) | 削除。ガードの追加は `ensure_guard` が行う |
 
-### 24.5 プールの本数はなぜこの値か
+### T.4 プールの本数はなぜこの値か
 
 「3 本は少なすぎないか、4096 本くらい保持してバックグラウンドで面倒を見ればよいのでは」
 という問いに対して測った。
@@ -1552,7 +1566,7 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
    カーネル側のコストとスケジューリングで破綻する。1 スレッドで多数の回路を
    多重化する作りに変えれば別だが、それは本プロジェクトの「スレッド + ブロッキング
    I/O」という前提そのものの変更になる。
-3. **持っていても品質は分からない**。§24.1 のとおり、使う前に良し悪しを予測する
+3. **持っていても品質は分からない**。「まず計測した」のとおり、使う前に良し悪しを予測する
    指標が無い。未計測の回路を 4096 本持っても、選ぶときはやはりランダムである。
 
 したがって上げたのは中程度まで: `MAX_CIRCUITS` 8 → 16、`CLEAN_TARGET` 3 → 6、
@@ -1561,7 +1575,7 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 だった(48 本設定でも 75 秒で 20 本前後しか溜まらなかった)。並列化後は 90 秒で
 回路 6 本 + stub 4 本に達し、VmHWM は 17.9MB のまま。
 
-### 24.6 ファイルに残すもの、残さないもの
+### T.4 ファイルに残すもの、残さないもの
 
 回路そのものは永続化できない(生きた TLS と鍵の状態で、プロセスと運命を共にする)。
 永続化する価値があるのは「どの中継が良かったか」だが、**これは調査班が最も危険と
@@ -1577,41 +1591,41 @@ M15〜M20 まで完了。`cargo test` 198 件、`cargo test -- --ignored` の実
 位置であり、記録しないと「前回使い物にならないと判断したガードに、次回の 1 本目で
 戻る」ことになる。古い形式のファイルもそのまま読める。
 
-### 24.7 残る弱点
+### T.4 残る弱点
 
 - **配信元が遅いだけの転送を回路のせいにしうる**。1 本の転送からは区別できない。
   代償は回路 1 本の廃棄(進行中の転送は続く)であり、3 回続けばガードも 1 回替わる。
 - ガード交代の匿名性コストは本物で、利用者の明示的な選択によるもの。README に明記した。
 - 「速い経路を選ぶ」ことは**していない**。できないと計測が示したため。
 
-### 24.8 M21. タスク(T.21、実施済み)
+### T.4 子タスク
 
-計画外の作業だが、追跡できるよう他のマイルストーンと同じ形でタスク番号を振る。
+計画外に始めた作業だが、他と同じく子タスクとして追跡する。
 
-- [x] **T.21.1** 計測: 回路 RTT・出口のコンセンサス帯域とスループットの相関を実ネットワークで調べる
-  (§24.1)。結論は「事前に速い経路を見分ける指標は無い」。
-- [x] **T.21.2** `circuit.rs` の `Meter`: 受信バイトと**実際に受信していた時間**(セル間隔 500ms 以下のみ)
-  を `Inner` の atomic に積算する(§24.3、§24.4)。
-- [x] **T.21.3** `Circuit::probe()`: 終端ホップへ BEGIN_DIR を出す生存プローブ。拒否も生存とみなす(§24.3)。
-- [x] **T.21.4** `pool.rs` の `judge()`: 1MiB 以上・実受信 2 秒以上で 150 KB/s 未満なら `TooSlow`
-  (プールから外すだけで閉じない)、応答しなければ `Unresponsive`(閉じる)(§24.3)。
-- [x] **T.21.5** `circuit_for`: 最小負荷の候補から**ランダム**に選ぶ。走査は 1 回に統一(§24.3、§24.4)。
-- [x] **T.21.6** ガードの降格: 30 分以内に 3 回ダメな回路を出したガードは次点へ。1 実行あたり 2 回まで、
-  1 スイープにつき 1 ストライク、`stop_using` で既存回路は残す、`demoted_at` で 30 分持続(§24.3、§24.4)。
-- [x] **T.21.7** 降格の永続化: `state/guards` に `demoted <unix>` を追記。旧形式も読める。
-  中継の点数は永続化しない(§24.6)。
-- [x] **T.21.8** 多エージェントレビューで確認された欠陥の修正(§24.4 の表)。
-  - [x] **T.21.8.1** `circuit_for` の 2 回走査による `rand::below(0)` の panic と Mutex の poison
+- [x] **T.4.1** 計測: 回路 RTT・出口のコンセンサス帯域とスループットの相関を実ネットワークで調べる
+  (「まず計測した」)。結論は「事前に速い経路を見分ける指標は無い」。
+- [x] **T.4.2** `circuit.rs` の `Meter`: 受信バイトと**実際に受信していた時間**(セル間隔 500ms 以下のみ)
+  を `Inner` の atomic に積算する(「入れたもの」「レビューで潰した欠陥」)。
+- [x] **T.4.3** `Circuit::probe()`: 終端ホップへ BEGIN_DIR を出す生存プローブ。拒否も生存とみなす(「入れたもの」)。
+- [x] **T.4.4** `pool.rs` の `judge()`: 1MiB 以上・実受信 2 秒以上で 150 KB/s 未満なら `TooSlow`
+  (プールから外すだけで閉じない)、応答しなければ `Unresponsive`(閉じる)(「入れたもの」)。
+- [x] **T.4.5** `circuit_for`: 最小負荷の候補から**ランダム**に選ぶ。走査は 1 回に統一(「入れたもの」「レビューで潰した欠陥」)。
+- [x] **T.4.6** ガードの降格: 30 分以内に 3 回ダメな回路を出したガードは次点へ。1 実行あたり 2 回まで、
+  1 スイープにつき 1 ストライク、`stop_using` で既存回路は残す、`demoted_at` で 30 分持続(「入れたもの」「レビューで潰した欠陥」)。
+- [x] **T.4.7** 降格の永続化: `state/guards` に `demoted <unix>` を追記。旧形式も読める。
+  中継の点数は永続化しない(「ファイルに残すもの、残さないもの」)。
+- [x] **T.4.8** 多エージェントレビューで確認された欠陥の修正(「レビューで潰した欠陥」の表)。
+  - [x] **T.4.8.1** `circuit_for` の 2 回走査による `rand::below(0)` の panic と Mutex の poison
     → 1 回走査に統一。
-  - [x] **T.21.8.2** スループットを壁時計で割っていた → 実際に受信していた時間だけを積算。
-  - [x] **T.21.8.3** 「読み手が待っている＝死んでいる」の誤判定で idle な接続を殺していた
+  - [x] **T.4.8.2** スループットを壁時計で割っていた → 実際に受信していた時間だけを積算。
+  - [x] **T.4.8.3** 「読み手が待っている＝死んでいる」の誤判定で idle な接続を殺していた
     → 生存プローブに置換。
-  - [x] **T.21.8.4** `retire()` の blame を 6 箇所中 5 箇所で捨てていた → blame を `State` に持たせる。
-  - [x] **T.21.8.5** 1 回の障害で 3 ストライクを使い切る → 1 スイープにつきガード 1 ストライク。
-  - [x] **T.21.8.6** 降格が `mark_failed` でチャネルを閉じ、通信中のストリームが切れる → `stop_using` を追加。
-  - [x] **T.21.8.7** プールのロック中に `Circuit::close()` を呼んでいた → ロック解放後に閉じる。
-  - [x] **T.21.8.8** 降格が 10 分後の `retry_primary_guard` で復活する → `demoted_at` で 30 分持続。
-  - [x] **T.21.8.9** 到達不能条件 `len() < 2 && len() >= MAX_GUARDS` → 削除。
-- [x] **T.21.9** プールの本数を引き上げる: `MAX_CIRCUITS` 8 → 16、`CLEAN_TARGET` 3 → 6、
-  `STUB_TARGET` 2 → 3(§24.5)。
-- [x] **T.21.10** ビルダーの並列化(`BUILD_PARALLEL = 3`)。VmHWM は 17.9MB のまま(§24.5)。
+  - [x] **T.4.8.4** `retire()` の blame を 6 箇所中 5 箇所で捨てていた → blame を `State` に持たせる。
+  - [x] **T.4.8.5** 1 回の障害で 3 ストライクを使い切る → 1 スイープにつきガード 1 ストライク。
+  - [x] **T.4.8.6** 降格が `mark_failed` でチャネルを閉じ、通信中のストリームが切れる → `stop_using` を追加。
+  - [x] **T.4.8.7** プールのロック中に `Circuit::close()` を呼んでいた → ロック解放後に閉じる。
+  - [x] **T.4.8.8** 降格が 10 分後の `retry_primary_guard` で復活する → `demoted_at` で 30 分持続。
+  - [x] **T.4.8.9** 到達不能条件 `len() < 2 && len() >= MAX_GUARDS` → 削除。
+- [x] **T.4.9** プールの本数を引き上げる: `MAX_CIRCUITS` 8 → 16、`CLEAN_TARGET` 3 → 6、
+  `STUB_TARGET` 2 → 3(「プールの本数はなぜこの値か」)。
+- [x] **T.4.10** ビルダーの並列化(`BUILD_PARALLEL = 3`)。VmHWM は 17.9MB のまま(「プールの本数はなぜこの値か」)。
