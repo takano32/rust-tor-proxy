@@ -12,13 +12,18 @@
 //!
 //! A `.onion` host name never reaches an exit at all: it is a v3 onion
 //! address, and goes to a rendezvous circuit instead.
+//!
+//! `GET /status` is answered with the status page (see `status.rs`), and is
+//! answered even while the Tor client is still bootstrapping; proxy requests
+//! made during bootstrap wait until it is done.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::relay;
+use crate::status;
 use crate::tor::circuit::{self, StreamEnd};
 use crate::tor::client::TorClient;
 use crate::tor::hs::address::{self, OnionAddress};
@@ -67,6 +72,53 @@ enum Protocol {
     Http,
 }
 
+/// The listening side, shared by every connection thread.
+pub struct Front {
+    listen_port: u16,
+    /// `None` until the Tor client has bootstrapped.
+    client: Mutex<Option<Arc<TorClient>>>,
+    ready: Condvar,
+}
+
+impl Front {
+    pub fn new(listen_port: u16) -> Self {
+        Self {
+            listen_port,
+            client: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Hand over the bootstrapped client, releasing the requests waiting
+    /// for it.
+    pub fn set_ready(&self, client: Arc<TorClient>) {
+        *self.client.lock().unwrap() = Some(client);
+        self.ready.notify_all();
+    }
+
+    fn client(&self) -> Option<Arc<TorClient>> {
+        self.client.lock().unwrap().clone()
+    }
+
+    fn wait_for_client(&self) -> Arc<TorClient> {
+        let mut client = self.client.lock().unwrap();
+        loop {
+            if let Some(client) = client.as_ref() {
+                return Arc::clone(client);
+            }
+            client = self.ready.wait(client).unwrap();
+        }
+    }
+}
+
+/// What a connection asked for.
+enum Asked {
+    /// A stream to somewhere, in one of the three proxy protocols.
+    Connect(Request),
+    /// The status page.
+    Status,
+}
+
 /// What the client asked for.
 struct Request {
     host: String,
@@ -74,7 +126,8 @@ struct Request {
     protocol: Protocol,
 }
 
-pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
+pub fn handle(mut client: TcpStream, front: &Front) {
+    status::ACCEPTED.inc();
     let peer = client
         .peer_addr()
         .map(|a| a.to_string())
@@ -90,12 +143,28 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         crate::debug!("{peer}: could not disable Nagle: {e}");
     }
     let request = match negotiate(&mut client) {
-        Ok(request) => request,
+        Ok(Asked::Connect(request)) => request,
+        Ok(Asked::Status) => {
+            status::STATUS_REQUESTS.inc();
+            if let Err(e) = serve_status(&mut client, front) {
+                crate::debug!("{peer}: could not send the status page: {e}");
+            }
+            return;
+        }
         Err(e) => {
+            status::HANDSHAKE_FAILED.inc();
             crate::debug!("{peer}: SOCKS handshake failed: {e}");
             return;
         }
     };
+    match request.protocol {
+        Protocol::Socks5 => status::SOCKS5.inc(),
+        Protocol::Socks4 => status::SOCKS4.inc(),
+        Protocol::Http => status::HTTP_CONNECT.inc(),
+    }
+    if address::is_onion(&request.host) {
+        status::ONION.inc();
+    }
     // An onion address names the destination in full, so it is only ever
     // logged at debug: an info line would put every service a user visits in
     // the log.
@@ -106,9 +175,11 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         crate::info!("{peer} -> {}:{}", request.host, request.port);
     }
 
-    let stream = match connect(tor, &request) {
+    let tor = front.wait_for_client();
+    let stream = match connect(&tor, &request) {
         Ok(stream) => stream,
         Err(e) => {
+            status::failed(reply_code(&e));
             if address::is_onion(&request.host) {
                 crate::warn!("{peer}: onion service on port {} failed: {e}", request.port);
             } else {
@@ -123,11 +194,16 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         stream.close();
         return;
     }
+    status::SUCCEEDED.inc();
     // The handshake timeout must not apply to the tunnelled connection.
     let _ = client.set_read_timeout(None);
 
-    let reader = stream.try_clone();
-    if let Err(e) = relay::bidirectional(client, reader, stream.try_clone()) {
+    status::ACTIVE.inc();
+    let reader = Counted::new(stream.try_clone(), &status::BYTES_DOWN);
+    let writer = Counted::new(stream.try_clone(), &status::BYTES_UP);
+    let relayed = relay::bidirectional(client, reader, writer);
+    status::ACTIVE.dec();
+    if let Err(e) = relayed {
         // With optimistic data the SOCKS reply has already gone out by the
         // time a refusal arrives, so the client sees a closed connection
         // rather than a status code. Say why here, or the reason is lost.
@@ -138,6 +214,50 @@ pub fn handle(mut client: TcpStream, tor: &Arc<TorClient>) {
         }
     }
     stream.close();
+}
+
+/// Send the status page and close.
+fn serve_status(client: &mut TcpStream, front: &Front) -> io::Result<()> {
+    let client_now = front.client();
+    let body = status::render(front.listen_port, client_now.as_deref());
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(response.as_bytes())
+}
+
+/// A stream half that adds the bytes passing through it to a counter.
+struct Counted<T> {
+    inner: T,
+    counter: &'static status::Counter,
+}
+
+impl<T> Counted<T> {
+    fn new(inner: T, counter: &'static status::Counter) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<T: Read> Read for Counted<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter.add(n as u64);
+        Ok(n)
+    }
+}
+
+impl<T: Write> Write for Counted<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.counter.add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Where a request wants to go.
@@ -172,12 +292,12 @@ fn connect(tor: &Arc<TorClient>, request: &Request) -> io::Result<crate::tor::ci
 
 /// Work out which protocol the client is speaking from its first byte, and
 /// run that protocol's handshake.
-fn negotiate(client: &mut TcpStream) -> io::Result<Request> {
+fn negotiate(client: &mut TcpStream) -> io::Result<Asked> {
     let mut first = [0u8; 1];
     client.read_exact(&mut first)?;
     match first[0] {
-        VERSION => negotiate_socks5(client),
-        SOCKS4_VERSION => negotiate_socks4(client),
+        VERSION => negotiate_socks5(client).map(Asked::Connect),
+        SOCKS4_VERSION => negotiate_socks4(client).map(Asked::Connect),
         // An HTTP method always starts with an uppercase letter.
         b'A'..=b'Z' => negotiate_http(client, first[0]),
         other => Err(invalid_data(format!(
@@ -339,7 +459,7 @@ fn read_until_nul(client: &mut TcpStream, limit: usize) -> io::Result<Vec<u8>> {
 
 /// `CONNECT host:port HTTP/1.x`, so that `https_proxy=http://127.0.0.1:9050`
 /// works without a SOCKS-aware client.
-fn negotiate_http(client: &mut TcpStream, first: u8) -> io::Result<Request> {
+fn negotiate_http(client: &mut TcpStream, first: u8) -> io::Result<Asked> {
     let head = read_http_head(client, first)?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -347,12 +467,18 @@ fn negotiate_http(client: &mut TcpStream, first: u8) -> io::Result<Request> {
     let method = fields.next().unwrap_or_default();
     let target = fields.next().unwrap_or_default();
 
+    // An origin-form `/status`, as a browser or `curl http://host:port/status`
+    // sends it. A proxied request carries an absolute URI instead.
+    if method == "GET" && (target == "/status" || target.starts_with("/status?")) {
+        return Ok(Asked::Status);
+    }
+
     if !method.eq_ignore_ascii_case("CONNECT") {
         // A plain proxied request (an absolute-URI GET) would send the whole
         // exchange in clear through the exit, so say what to use instead
         // rather than doing it.
         let body = "This is a Tor proxy. Use CONNECT, or point a SOCKS client \
-                    at this port (socks5h://).\n";
+                    at this port (socks5h://). The status page is at /status.\n";
         let response = format!(
             "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -377,11 +503,11 @@ fn negotiate_http(client: &mut TcpStream, first: u8) -> io::Result<Request> {
         send_reply(client, Protocol::Http, REP_GENERAL_FAILURE)?;
         return Err(invalid_data("empty host or port"));
     }
-    Ok(Request {
+    Ok(Asked::Connect(Request {
         host,
         port,
         protocol: Protocol::Http,
-    })
+    }))
 }
 
 /// Read the request line and headers, up to and including the blank line.
@@ -481,7 +607,10 @@ mod tests {
             seen
         });
         let (mut server, _) = listener.accept().unwrap();
-        let result = negotiate(&mut server);
+        let result = negotiate(&mut server).and_then(|asked| match asked {
+            Asked::Connect(request) => Ok(request),
+            Asked::Status => Err(invalid_data("asked for the status page")),
+        });
         // Close in two steps. A socket dropped while unread bytes are still
         // in its receive buffer -- which is exactly what a rejected request
         // leaves behind -- makes the kernel send RST rather than FIN, and the
@@ -613,6 +742,27 @@ mod tests {
         let text = String::from_utf8_lossy(&written);
         assert!(text.starts_with("HTTP/1.1 501 "), "{text}");
         assert!(text.contains("socks5h://"), "{text}");
+    }
+
+    /// `GET /status` asks for the status page; the same path in a proxied
+    /// request's absolute URI does not.
+    #[test]
+    fn recognises_a_status_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut sock = TcpStream::connect(addr).unwrap();
+            sock.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        assert!(matches!(negotiate(&mut server), Ok(Asked::Status)));
+        client.join().unwrap();
+
+        let request = b"GET http://example.com/status HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (parsed, written) = negotiate_with(request);
+        assert!(parsed.is_err());
+        assert!(String::from_utf8_lossy(&written).starts_with("HTTP/1.1 501 "));
     }
 
     /// A client that offers only username/password is accepted and its

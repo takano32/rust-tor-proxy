@@ -8,6 +8,7 @@ mod crypto;
 mod ffi;
 mod relay;
 mod socks5;
+mod status;
 mod tor;
 mod util;
 
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> std::io::Result<()> {
+    status::mark_start();
     // Before any thread exists, so that every thread started later shares the
     // arenas this allows.
     ffi::malloc::limit_arenas();
@@ -49,27 +51,44 @@ fn run() -> std::io::Result<()> {
     }
 
     // Bind before bootstrapping, so a port conflict is reported immediately
-    // rather than after a minute of directory work.
+    // rather than after a minute of directory work, and accept at once, so
+    // that the status page can say what the bootstrap is doing. Proxy
+    // requests that arrive meanwhile wait for it.
     let listener = TcpListener::bind(("0.0.0.0", config.listen_port))?;
+    let front = Arc::new(socks5::Front::new(config.listen_port));
     info!(
-        "bootstrapping the Tor client (state in {})",
+        "listening on 0.0.0.0:{} (status page at /status); bootstrapping the \
+         Tor client (state in {})",
+        config.listen_port,
         config.state_dir.display()
     );
 
-    let client = Arc::new(tor::client::TorClient::bootstrap(config.state_dir)?);
-    info!("ready: {}", client.consensus_summary());
-    info!(
-        "listening on 0.0.0.0:{} for SOCKS5, SOCKS4a and HTTP CONNECT",
-        config.listen_port
-    );
+    let ready = Arc::clone(&front);
+    let state_dir = config.state_dir;
+    let listen_port = config.listen_port;
+    std::thread::Builder::new()
+        .name("bootstrap".into())
+        .spawn(move || match tor::client::TorClient::bootstrap(state_dir) {
+            Ok(client) => {
+                info!("ready: {}", client.consensus_summary());
+                info!("serving SOCKS5, SOCKS4a and HTTP CONNECT on 0.0.0.0:{listen_port}");
+                ready.set_ready(client);
+            }
+            Err(e) => {
+                // Nothing can be served without a client, and a supervisor
+                // restarting the process is the best retry there is.
+                error!("bootstrap failed: {e}");
+                std::process::exit(1);
+            }
+        })?;
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(socket) => {
-                let client = Arc::clone(&client);
+                let front = Arc::clone(&front);
                 if let Err(e) = std::thread::Builder::new()
                     .name("socks5".into())
-                    .spawn(move || socks5::handle(socket, &client))
+                    .spawn(move || socks5::handle(socket, &front))
                 {
                     warn!("could not spawn a connection thread: {e}");
                 }

@@ -130,6 +130,26 @@ pub struct TorClient {
     onion_circuits: Mutex<HashMap<[u8; 32], PooledOnionCircuit>>,
 }
 
+/// What `TorClient::status` reports.
+pub struct ClientStatus {
+    pub relays: usize,
+    pub guard_relays: usize,
+    pub exit_relays: usize,
+    pub valid_after: u64,
+    pub fresh_until: u64,
+    pub valid_until: u64,
+    pub guards: usize,
+    pub guards_demoted: usize,
+    pub guards_unreachable: usize,
+    pub guard_channel_open: bool,
+    pub slow_guard_changes: usize,
+    pub stubs: usize,
+    pub circuits: usize,
+    pub onion_circuits: usize,
+    pub descriptors: usize,
+    pub hsdir_ring_built: bool,
+}
+
 struct PooledOnionCircuit {
     circuit: Circuit,
     built: Instant,
@@ -1303,6 +1323,49 @@ impl TorClient {
 
     pub fn consensus_summary(&self) -> String {
         self.directory().summary()
+    }
+
+    /// Counts for the status page. Nothing in here identifies a relay.
+    pub fn status(&self) -> ClientStatus {
+        use super::dir::consensus::{FLAG_EXIT, FLAG_GUARD, FLAG_RUNNING, FLAG_VALID};
+        let directory = self.directory();
+        let consensus = &directory.consensus;
+        let (guards, guards_demoted, guards_unreachable, guard_channel_open) = {
+            let guards = self.guards.lock().unwrap();
+            (
+                guards.entries.len(),
+                guards
+                    .entries
+                    .iter()
+                    .filter(|g| g.demoted_unix.is_some())
+                    .count(),
+                guards
+                    .entries
+                    .iter()
+                    .filter(|g| g.failed_at.is_some())
+                    .count(),
+                guards.open.is_some(),
+            )
+        };
+        let (stubs, circuits) = self.pool.counts();
+        ClientStatus {
+            relays: consensus.routers.len(),
+            guard_relays: consensus.count_with(FLAG_GUARD | FLAG_RUNNING | FLAG_VALID),
+            exit_relays: consensus.count_with(FLAG_EXIT | FLAG_RUNNING | FLAG_VALID),
+            valid_after: consensus.valid_after,
+            fresh_until: consensus.fresh_until,
+            valid_until: consensus.valid_until,
+            guards,
+            guards_demoted,
+            guards_unreachable,
+            guard_channel_open,
+            slow_guard_changes: self.slow_guard_changes.load(Ordering::Relaxed),
+            stubs,
+            circuits,
+            onion_circuits: self.onion_circuits.lock().unwrap().len(),
+            descriptors: self.descriptors.lock().unwrap().len(),
+            hsdir_ring_built: self.hsdir_ring.lock().unwrap().is_some(),
+        }
     }
 
     /// The verified consensus. Only the live tests reach for this; everything

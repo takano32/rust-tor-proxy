@@ -98,6 +98,33 @@ the same three protocols on that one port:
 curl --socks5-hostname 3950x-tokyo.sorahost.net:63320 https://check.torproject.org/api/ip
 ```
 
+## Status page
+
+A plain `GET /status` on the proxy port returns JSON describing the running
+process, so a browser or `curl` can tell whether it is healthy and which build
+it is:
+
+```sh
+curl http://3950x-tokyo.sorahost.net:63320/status
+```
+
+It reports the version and commit, whether the client is still bootstrapping,
+uptime, connection and failure counts (by SOCKS reply code), bytes relayed,
+the consensus it holds and whether that is still live, how many guards it
+has and how many are demoted or unreachable, the circuit pool, and memory
+(`VmRSS`, `VmHWM`, threads). It answers from the moment the port is bound,
+before bootstrap finishes; proxy requests made during bootstrap wait for it.
+
+The page is public, so it contains nothing about who uses the proxy or where
+they go: no client addresses, destinations, onion addresses or guard
+identities.
+
+To have the commit appear, build with it:
+
+```sh
+RUST_TOR_PROXY_COMMIT=$(git rev-parse --short HEAD) cargo build --release
+```
+
 ## Measured
 
 On aarch64 with Rust 1.96 and OpenSSL 3.6.4, against the live Tor network.
