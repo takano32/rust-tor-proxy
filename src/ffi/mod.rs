@@ -9,7 +9,7 @@
 //! `#[link(name = "ssl")]` would make the linker look for `libssl.so`, the
 //! unversioned symlink that only a `-dev`/`-devel` package installs. Deployment
 //! containers routinely ship just the runtime `libssl.so.3`, and the project's
-//! stated requirement (TASKS.md 0.3) is that the runtime libraries alone are
+//! stated requirement (TASKS.md, T.1) is that the runtime libraries alone are
 //! enough. So every entry point is resolved once with `dlopen`/`dlsym`, the
 //! binary records no `DT_NEEDED` entry for OpenSSL, and the file name and
 //! directory can both vary.

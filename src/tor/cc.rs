@@ -12,9 +12,6 @@
 //! Section numbers in the comments below refer to
 //! `proposals/324-rtt-congestion-control.txt`.
 
-// Nothing outside this module drives the state machine yet -- wiring it into
-// `circuit.rs` is the rest of M19 -- so the binary target would otherwise
-// warn about every item here. Drop this once a circuit constructs a `Vegas`.
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
